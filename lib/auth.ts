@@ -3,11 +3,14 @@ import "./env";
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
+import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { db, unwrap, unwrapMaybe } from "./db";
 import { verifyOtp } from "./otp";
 
 const APP_ROLE = "DEALER";
+
+const supabaseTokenSchema = z.object({ supabaseAccessToken: z.string().min(20) });
 
 const otpSchema = z.object({
   phone: z.string().min(10).max(15),
@@ -51,11 +54,32 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       credentials: {
         phone: { label: "Phone", type: "tel" },
         otp: { label: "OTP", type: "text" },
+        supabaseAccessToken: { label: "Supabase access token", type: "text" },
         dev: { label: "Dev", type: "checkbox" },
       },
       async authorize(creds) {
-        // This portal authenticates dealers exclusively with the locally issued
-        // SMS code. It never delegates login OTP delivery to Supabase email.
+        // Email OTP is the recommended dealer sign-in route. The browser only
+        // presents a Supabase token; its validity is checked here before the
+        // user is matched to an existing dealer account.
+        if (creds.supabaseAccessToken) {
+          const parsed = supabaseTokenSchema.safeParse(creds);
+          if (!parsed.success) return null;
+          const url = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
+          const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+          if (!url || !anon) return null;
+          const supabase = createClient(url, anon, { auth: { persistSession: false } });
+          const { data, error } = await supabase.auth.getUser(parsed.data.supabaseAccessToken);
+          const email = data.user?.email?.toLowerCase();
+          if (error || !email) return null;
+          const user = unwrapMaybe(
+            await db.from("User").select("id, email, name, role").eq("email", email).maybeSingle(),
+            "auth: dealer email lookup",
+          );
+          if (!user || user.role !== APP_ROLE) return null;
+          return { id: user.id, email: user.email, name: user.name, role: user.role };
+        }
+
+        // SMS OTP remains available for a dealer's registered phone number.
         if (creds.phone && creds.otp) {
           const parsed = otpSchema.safeParse(creds);
           if (!parsed.success) return null;
