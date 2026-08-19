@@ -7,7 +7,7 @@ Deployed to **https://dealer.wheewise.com**.
 ## This repo is generated
 
 It is produced from the Wheewise monorepo by `scripts/build-role-repos.mjs`.
-`lib/`, `components/`, `prisma/`, `tests/` and the build configuration are
+`lib/`, `components/`, `supabase/`, `tests/` and the build configuration are
 **byte-identical** across `user-app`, `dealer-app` and `admin-app`; only
 `app/` differs. Change shared code in the monorepo and regenerate, rather than
 editing it here — otherwise the three repos drift apart.
@@ -23,18 +23,22 @@ What is unique to this repo:
 ```bash
 npm install
 cp .env.example .env      # then fill in the values below
-npx prisma generate
 npm run dev
 ```
 
+The database schema lives in `supabase/schema.sql`. Apply it once per Supabase
+project (SQL editor, or `npm run db:push`) before the first boot.
+
 ## Environment variables
 
-All three apps share **one database** and **one `AUTH_SECRET`**. A session
-issued by any of them must verify in the other two.
+All three apps share **one Supabase project** and **one `AUTH_SECRET`**. A
+session issued by any of them must verify in the other two.
 
 | Variable | Required | Notes |
 |---|---|---|
-| `DATABASE_URL` | yes | Same Neon/Postgres instance for all three apps |
+| `NEXT_PUBLIC_SUPABASE_URL` | yes | Same Supabase project for all three apps |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | yes | Public; safe in the browser bundle |
+| `SUPABASE_SERVICE_ROLE_KEY` | yes | **Server only** — bypasses RLS, never `NEXT_PUBLIC_` |
 | `AUTH_SECRET` | yes | **Identical** across all three projects |
 | `AUTH_URL` | yes | `https://dealer.wheewise.com` |
 | `AUTH_TRUST_HOST` | yes | `true` on Vercel |

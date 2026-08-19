@@ -1,25 +1,29 @@
 import { requireDealer } from "@/lib/dealer";
-import { prisma } from "@/lib/db";
+import { db, unwrap } from "@/lib/db";
 import { RequestInspectionButton } from "./RequestButton";
 
 export default async function DealerInspectionsPage() {
   const { dealer } = await requireDealer();
 
-  const inspections = await prisma.inspection.findMany({
-    where: { dealerId: dealer.id },
-    include: {
-      listing: { select: { make: true, model: true, year: true } },
-      inspector: { select: { user: { select: { name: true } } } },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  const inspections = unwrap(
+    await db
+      .from("Inspection")
+      .select("*, listing:Listing(make, model, year), inspector:Inspector(user:User(name))")
+      .eq("dealerId", dealer.id)
+      .order("createdAt", { ascending: false }),
+    "dealer inspections",
+  );
   type Inspection = (typeof inspections)[number];
 
-  const listings = await prisma.listing.findMany({
-    where: { dealerId: dealer.id, status: "ACTIVE" },
-    select: { id: true, make: true, model: true, year: true },
-    orderBy: { createdAt: "desc" },
-  });
+  const listings = unwrap(
+    await db
+      .from("Listing")
+      .select("id, make, model, year")
+      .eq("dealerId", dealer.id)
+      .eq("status", "ACTIVE")
+      .order("createdAt", { ascending: false }),
+    "dealer inspections: listings",
+  );
   type InspectableListing = (typeof listings)[number];
 
   const inspectedIds = new Set(
@@ -77,7 +81,7 @@ export default async function DealerInspectionsPage() {
                   </span>
                   <p className="text-xs text-zinc-500">
                     {new Date(i.createdAt).toLocaleDateString("en-IN")}
-                    {i.inspector ? ` · ${i.inspector.user.name ?? "Inspector"}` : ""}
+                    {i.inspector ? ` · ${i.inspector.user?.name ?? "Inspector"}` : ""}
                     {i.overallScore != null ? ` · Score: ${i.overallScore}%` : ""}
                   </p>
                 </div>

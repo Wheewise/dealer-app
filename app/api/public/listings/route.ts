@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { validateApiKey } from "@/lib/api-auth";
-import { prisma } from "@/lib/db";
+import { count, db, unwrap, withFilters, type FilterChain } from "@/lib/db";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 
 export async function GET(req: Request) {
@@ -22,59 +22,67 @@ export async function GET(req: Request) {
   const city = searchParams.get("city");
   const type = searchParams.get("type");
 
-  const where = {
-    status: "ACTIVE" as const,
-    ...(q
-      ? {
-          OR: [
-            { make: { contains: q, mode: "insensitive" as const } },
-            { model: { contains: q, mode: "insensitive" as const } },
-          ],
-        }
-      : {}),
-    ...(city ? { city: { contains: city, mode: "insensitive" as const } } : {}),
-    ...(type === "CAR" || type === "BIKE" ? { vehicleType: type as "CAR" | "BIKE" } : {}),
+  // Quoted so a comma or parenthesis in the term cannot terminate the value
+  // and change which columns the `or=` filter matches.
+  const quote = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+
+  // The count and the page must see the same predicate, so it is written once.
+  const predicate = (query: FilterChain): FilterChain => {
+    let out = query.eq("status", "ACTIVE");
+    if (q) {
+      const term = quote(`%${q}%`);
+      out = out.or(`make.ilike.${term},model.ilike.${term}`);
+    }
+    if (city) out = out.ilike("city", `%${city}%`);
+    if (type === "CAR" || type === "BIKE") out = out.eq("vehicleType", type);
+    return out;
   };
 
+  const from = (page - 1) * limit;
+
   const [listings, total] = await Promise.all([
-    prisma.listing.findMany({
-      where,
-      select: {
-        id: true,
-        make: true,
-        model: true,
-        year: true,
-        fuelType: true,
-        transmission: true,
-        odometerKm: true,
-        askingPrice: true,
-        city: true,
-        createdAt: true,
-        photos: { take: 1, orderBy: { sortOrder: "asc" } },
-        dealer: { select: { businessName: true, city: true } },
-      },
-      orderBy: { createdAt: "desc" },
-      skip: (page - 1) * limit,
-      take: limit,
-    }),
-    prisma.listing.count({ where }),
+    withFilters(
+      db
+        .from("Listing")
+        .select(
+          `id, make, model, year, fuelType, transmission, odometerKm, askingPrice,
+           city, createdAt,
+           photos:ListingPhoto(url, sortOrder),
+           dealer:Dealer(businessName, city)`,
+        ),
+      predicate,
+    )
+      .order("createdAt", { ascending: false })
+      .range(from, from + limit - 1)
+      .then((r) => unwrap(r, "GET /api/public/listings")),
+    count(
+      withFilters(
+        db.from("Listing").select("id", { count: "exact", head: true }),
+        predicate,
+      ),
+    ),
   ]);
 
-  type PublicListing = (typeof listings)[number];
-  const data = listings.map((l: PublicListing) => ({
-    id: l.id,
-    make: l.make,
-    model: l.model,
-    year: l.year,
-    fuelType: l.fuelType,
-    transmission: l.transmission,
-    odometerKm: l.odometerKm,
-    askingPrice: Number(l.askingPrice),
-    city: l.city,
-    dealer: l.dealer,
-    coverUrl: l.photos[0]?.url ?? null,
-    createdAt: l.createdAt,
-  }));
+  const data = listings.map((l) => {
+    const dealer = Array.isArray(l.dealer) ? (l.dealer[0] ?? null) : l.dealer;
+    // PostgREST cannot order an embed per parent row, so the cover photo is
+    // picked here.
+    const cover = [...(l.photos ?? [])].sort((a, b) => a.sortOrder - b.sortOrder)[0];
+    return {
+      id: l.id,
+      make: l.make,
+      model: l.model,
+      year: l.year,
+      fuelType: l.fuelType,
+      transmission: l.transmission,
+      odometerKm: l.odometerKm,
+      askingPrice: Number(l.askingPrice),
+      city: l.city,
+      dealer,
+      coverUrl: cover?.url ?? null,
+      createdAt: l.createdAt,
+    };
+  });
 
   return NextResponse.json({
     data,

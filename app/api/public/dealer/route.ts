@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { validateApiKey } from "@/lib/api-auth";
-import { prisma } from "@/lib/db";
+import { count, db, unwrapMaybe } from "@/lib/db";
 
 export async function GET(req: Request) {
   const dealerId = await validateApiKey(req);
@@ -8,27 +8,42 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Invalid API key" }, { status: 401 });
   }
 
-  const dealer = await prisma.dealer.findUnique({
-    where: { id: dealerId },
-    select: {
-      id: true,
-      businessName: true,
-      city: true,
-      phone: true,
-      gstVerified: true,
-      status: true,
-      createdAt: true,
-      store: { select: { slug: true, bio: true, logoUrl: true } },
-    },
-  });
+  const row = unwrapMaybe(
+    await db
+      .from("Dealer")
+      .select(
+        `id, businessName, city, phone, gstVerified, status, createdAt,
+         store:Store(slug, bio, logoUrl)`,
+      )
+      .eq("id", dealerId)
+      .maybeSingle(),
+    "GET /api/public/dealer",
+  );
 
-  if (!dealer) {
+  if (!row) {
     return NextResponse.json({ error: "Dealer not found" }, { status: 404 });
   }
 
+  const dealer = {
+    ...row,
+    store: Array.isArray(row.store) ? (row.store[0] ?? null) : row.store,
+  };
+
   const [activeCount, soldCount] = await Promise.all([
-    prisma.listing.count({ where: { dealerId, status: "ACTIVE" } }),
-    prisma.listing.count({ where: { dealerId, status: "SOLD" } }),
+    count(
+      db
+        .from("Listing")
+        .select("id", { count: "exact", head: true })
+        .eq("dealerId", dealerId)
+        .eq("status", "ACTIVE"),
+    ),
+    count(
+      db
+        .from("Listing")
+        .select("id", { count: "exact", head: true })
+        .eq("dealerId", dealerId)
+        .eq("status", "SOLD"),
+    ),
   ]);
 
   return NextResponse.json({

@@ -1,0 +1,84 @@
+# Supabase CLI configuration.
+#
+# Used by `supabase link` / `supabase db push` / `supabase gen types`.
+# Replace project_id with your project ref (Settings → General).
+#
+#   scoop bucket add supabase https://github.com/supabase/scoop-bucket.git
+#   scoop install supabase-beta
+#   supabase link --project-ref <ref>
+#   supabase db push
+#
+# Note: `supabase start` (the local stack) additionally requires Docker.
+# Without it, use the remote-linked commands above, and run the RLS harness
+# against a Supabase *branch* rather than production.
+
+project_id = "wheewise"
+
+[db]
+# Must match the Postgres major version of the hosted project, or `db push`
+# will refuse to run.
+major_version = 17
+
+[db.migrations]
+schema_paths = ["./migrations/*.sql"]
+
+[auth]
+# The user app is the canonical site; the other two are added as additional
+# redirect targets so one Supabase project serves all three subdomains.
+site_url = "https://wheewise.com"
+additional_redirect_urls = [
+  "https://wheewise.com/auth/callback",
+  "https://dealer.wheewise.com/auth/callback",
+  "https://admin.wheewise.com/auth/callback",
+  "http://localhost:3000/auth/callback",
+]
+
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+
+# Sign-ups are open, but every new account is created as BUYER by a database
+# trigger — role is never read from sign-up metadata, which the client
+# controls. See supabase/migrations/0001_rls_foundation.sql.
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+# Required before Google sign-in is enabled: without confirmation, an OAuth
+# identity and a password account for the same address become two users.
+enable_confirmations = true
+secure_password_change = true
+
+[auth.email.smtp]
+# Resend as the SMTP sender for confirmation / reset / magic-link mail.
+# The password is the Resend API key and belongs in the dashboard or in
+# SUPABASE_AUTH_SMTP_PASS — never committed here.
+enabled = true
+host = "smtp.resend.com"
+port = 465
+user = "resend"
+# The CLI requires this field to be present even though the real value lives
+# in the dashboard. `env(...)` keeps the secret out of the repo.
+pass = "env(SUPABASE_AUTH_SMTP_PASS)"
+sender_name = "Wheewise"
+# admin_email must be on a domain verified in Resend (SPF + DKIM).
+admin_email = "noreply@wheewise.com"
+
+[auth.external.google]
+enabled = true
+# Values come from environment, never from this file.
+client_id = "env(SUPABASE_AUTH_GOOGLE_CLIENT_ID)"
+secret = "env(SUPABASE_AUTH_GOOGLE_SECRET)"
+skip_nonce_check = false
+
+[auth.captcha]
+# Turnstile on the hosted auth endpoints. Enable after the stage-3 cutover;
+# the app's own forms are already protected independently.
+enabled = false
+provider = "turnstile"
+secret = "env(TURNSTILE_SECRET_KEY)"
+
+[auth.rate_limit]
+# The default of 4/hour throttles password resets in a way that reads as a
+# bug. Raise once the Resend sending domain is verified.
+email_sent = 30

@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { db, unwrap, unwrapMaybe } from "@/lib/db";
 import { requireDealer } from "@/lib/dealer";
 import { listingSchema } from "@/lib/validators/listing";
 
@@ -75,33 +75,42 @@ export async function createListing(
     city: data.city,
   });
 
-  // Sequential creates rather than one nested Listing->Photos/Photos360
-  // write: a nested create needs an interactive transaction, which Neon's
-  // HTTP-mode adapter (used in every environment now — see lib/db.ts) can't
-  // provide. `createMany` also goes through that same transaction machinery
-  // and fails the same way, so each photo is inserted with its own `create`.
-  let listing;
+  // Listing first, then its photos. PostgREST has no interactive transaction,
+  // so this is three statements rather than one nested write; deleting the
+  // listing is the compensating action, and photos cascade with it.
+  let listing: { id: string } | undefined;
   try {
-    listing = await prisma.listing.create({
-      data: {
-        ...data,
-        description: finalDescription,
-        dealerId: dealer.id,
-      },
-    });
+    listing = unwrap(
+      await db
+        .from("Listing")
+        .insert({ ...data, description: finalDescription, dealerId: dealer.id })
+        .select("id")
+        .single(),
+      "createListing",
+    );
 
-    for (const [i, url] of photoUrls.entries()) {
-      await prisma.listingPhoto.create({ data: { listingId: listing.id, url, sortOrder: i } });
+    if (photoUrls.length > 0) {
+      unwrap(
+        await db
+          .from("ListingPhoto")
+          .insert(photoUrls.map((url, i) => ({ listingId: listing!.id, url, sortOrder: i })))
+          .select("id"),
+        "createListing photos",
+      );
     }
-    for (const p of photo360) {
-      await prisma.listing360Photo.create({
-        data: { listingId: listing.id, url: p.url, angle: p.angle },
-      });
+    if (photo360.length > 0) {
+      unwrap(
+        await db
+          .from("Listing360Photo")
+          .insert(photo360.map((p) => ({ listingId: listing!.id, url: p.url, angle: p.angle })))
+          .select("id"),
+        "createListing 360 photos",
+      );
     }
   } catch (error) {
     console.error("[createListing] failed:", error);
     if (listing) {
-      await prisma.listing.delete({ where: { id: listing.id } }).catch(() => {});
+      await db.from("Listing").delete().eq("id", listing.id);
     }
     return {
       ok: false,
@@ -122,10 +131,17 @@ export async function updateListing(
   formData: FormData,
 ): Promise<ListingActionState> {
   const { dealer } = await requireDealer({ write: true });
-  const existing = await prisma.listing.findFirst({
-    where: { id: listingId, dealerId: dealer.id },
-    select: { id: true },
-  });
+  // The dealerId filter is the ownership check — it is what stops one dealer
+  // editing another's inventory, and it must stay on every query here.
+  const existing = unwrapMaybe(
+    await db
+      .from("Listing")
+      .select("id")
+      .eq("id", listingId)
+      .eq("dealerId", dealer.id)
+      .maybeSingle(),
+    "updateListing lookup",
+  );
   if (!existing) return { ok: false, errors: {}, formError: "Listing not found" };
 
   const { parsed, photo360 } = parseFromForm(formData);
@@ -151,11 +167,14 @@ export async function updateListing(
   });
 
   // Fetch existing photos to diff against — only delete/create what changed
-  const existingPhotos = await prisma.listingPhoto.findMany({
-    where: { listingId },
-    select: { id: true, url: true },
-    orderBy: { sortOrder: "asc" },
-  });
+  const existingPhotos = unwrap(
+    await db
+      .from("ListingPhoto")
+      .select("id, url")
+      .eq("listingId", listingId)
+      .order("sortOrder", { ascending: true }),
+    "updateListing photos",
+  );
 
   const existingUrls = new Set(existingPhotos.map((p) => p.url));
   const incomingUrls = new Set(photoUrls);
@@ -168,10 +187,10 @@ export async function updateListing(
     .filter((p) => !existingUrls.has(p.url));
 
   // Fetch existing 360 photos
-  const existing360 = await prisma.listing360Photo.findMany({
-    where: { listingId },
-    select: { id: true, url: true },
-  });
+  const existing360 = unwrap(
+    await db.from("Listing360Photo").select("id, url").eq("listingId", listingId),
+    "updateListing 360 photos",
+  );
   const existing360Urls = new Set(existing360.map((p) => p.url));
   const incoming360Urls = new Set(photo360.map((p) => p.url));
   const toDelete360 = existing360
@@ -179,35 +198,61 @@ export async function updateListing(
     .map((p) => p.id);
   const toAdd360 = photo360.filter((p) => !existing360Urls.has(p.url));
 
-  // Sequential operations rather than $transaction([...]): Neon's HTTP-mode
-  // adapter (used in every environment now — see lib/db.ts) can't run
-  // interactive transactions. Same ordering as before, just not atomic.
-  await prisma.listing.update({
-    where: { id: listingId },
-    data: {
-      ...data,
-      description: finalDescription,
-    },
-  });
+  // Sequential statements: PostgREST offers no interactive transaction, so
+  // the ordering below is the same as before but not atomic. Deletes and
+  // inserts are batched, which the previous per-row loops could not be.
+  unwrap(
+    await db
+      .from("Listing")
+      .update({ ...data, description: finalDescription })
+      .eq("id", listingId)
+      .eq("dealerId", dealer.id)
+      .select("id"),
+    "updateListing",
+  );
 
   if (toDelete.length > 0) {
-    await prisma.listingPhoto.deleteMany({ where: { id: { in: toDelete } } });
+    unwrap(
+      await db.from("ListingPhoto").delete().in("id", toDelete).select("id"),
+      "updateListing delete photos",
+    );
   }
-  for (const p of toAdd) {
-    await prisma.listingPhoto.create({
-      data: { listingId, url: p.url, sortOrder: p.sortOrder },
-    });
+  if (toAdd.length > 0) {
+    unwrap(
+      await db
+        .from("ListingPhoto")
+        .insert(toAdd.map((p) => ({ listingId, url: p.url, sortOrder: p.sortOrder })))
+        .select("id"),
+      "updateListing add photos",
+    );
   }
+  // Re-sequence the photos that survived, so the dealer's ordering sticks.
   for (const [index, url] of photoUrls.entries()) {
     const photoId = existingPhotos.find((p) => p.url === url)?.id;
     if (!photoId) continue;
-    await prisma.listingPhoto.update({ where: { id: photoId }, data: { sortOrder: index } });
+    unwrap(
+      await db
+        .from("ListingPhoto")
+        .update({ sortOrder: index })
+        .eq("id", photoId)
+        .select("id"),
+      "updateListing reorder photos",
+    );
   }
   if (toDelete360.length > 0) {
-    await prisma.listing360Photo.deleteMany({ where: { id: { in: toDelete360 } } });
+    unwrap(
+      await db.from("Listing360Photo").delete().in("id", toDelete360).select("id"),
+      "updateListing delete 360 photos",
+    );
   }
-  for (const p of toAdd360) {
-    await prisma.listing360Photo.create({ data: { listingId, url: p.url, angle: p.angle } });
+  if (toAdd360.length > 0) {
+    unwrap(
+      await db
+        .from("Listing360Photo")
+        .insert(toAdd360.map((p) => ({ listingId, url: p.url, angle: p.angle })))
+        .select("id"),
+      "updateListing add 360 photos",
+    );
   }
 
   // Log orphaned photo count for future cleanup job
@@ -232,16 +277,19 @@ export async function setListingStatus(
   status: "ACTIVE" | "SOLD" | "PAUSED",
 ): Promise<ListingMutationResult> {
   const { dealer } = await requireDealer({ write: true });
-  // updateMany runs as a multi-statement transaction, which the Cloudflare
-  // Workers Neon HTTP adapter can't do (see lib/db.ts) — findFirst + update
-  // instead, same ownership check, no transaction required.
-  const listing = await prisma.listing.findFirst({
-    where: { id: listingId, dealerId: dealer.id },
-    select: { id: true },
-  });
-  if (!listing) return { ok: false, error: "Listing not found" };
+  // The update carries the dealerId filter too, so ownership is enforced by
+  // the statement that writes rather than only by the one that read.
+  const updated = unwrap(
+    await db
+      .from("Listing")
+      .update({ status })
+      .eq("id", listingId)
+      .eq("dealerId", dealer.id)
+      .select("id"),
+    "setListingStatus",
+  );
+  if (updated.length === 0) return { ok: false, error: "Listing not found" };
 
-  await prisma.listing.update({ where: { id: listing.id }, data: { status } });
   revalidatePath("/dashboard");
   revalidatePath("/dashboard/inventory");
   revalidatePath(`/dashboard/inventory/${listingId}/edit`);
@@ -259,18 +307,20 @@ export async function markAsSold(listingId: string): Promise<ListingMutationResu
 
 export async function deleteListing(listingId: string): Promise<ListingMutationResult> {
   const { dealer } = await requireDealer({ write: true });
-  // deleteMany runs as a multi-statement transaction, which the Cloudflare
-  // Workers Neon HTTP adapter can't do (see lib/db.ts) — findFirst + delete
-  // instead. ListingPhoto/Listing360Photo/Enquiry/Conversation/etc. all
-  // cascade at the DB level (onDelete: Cascade in schema.prisma), so no
-  // separate photo cleanup step is needed.
-  const listing = await prisma.listing.findFirst({
-    where: { id: listingId, dealerId: dealer.id },
-    select: { id: true },
-  });
-  if (!listing) return { ok: false, error: "Listing not found" };
+  // ListingPhoto / Listing360Photo / Enquiry / Conversation and the rest all
+  // cascade at the database level (see supabase/schema.sql), so there is no
+  // separate cleanup step. The dealerId filter is the ownership check.
+  const deleted = unwrap(
+    await db
+      .from("Listing")
+      .delete()
+      .eq("id", listingId)
+      .eq("dealerId", dealer.id)
+      .select("id"),
+    "deleteListing",
+  );
+  if (deleted.length === 0) return { ok: false, error: "Listing not found" };
 
-  await prisma.listing.delete({ where: { id: listing.id } });
   revalidatePath("/dashboard");
   revalidatePath("/dashboard/inventory");
   revalidatePath(`/s/${dealer.store?.slug}/showcase`);
@@ -282,13 +332,17 @@ export async function bulkSetStatus(
   status: "ACTIVE" | "SOLD" | "PAUSED",
 ): Promise<ListingMutationResult> {
   const { dealer } = await requireDealer({ write: true });
-  const owned = await prisma.listing.findMany({
-    where: { id: { in: listingIds }, dealerId: dealer.id },
-    select: { id: true },
-  });
-  for (const { id } of owned) {
-    await prisma.listing.update({ where: { id }, data: { status } });
-  }
+  // One statement for the whole selection. The dealerId filter means ids the
+  // caller does not own simply do not match, rather than being rejected.
+  unwrap(
+    await db
+      .from("Listing")
+      .update({ status })
+      .in("id", listingIds)
+      .eq("dealerId", dealer.id)
+      .select("id"),
+    "bulkSetStatus",
+  );
   revalidatePath("/dashboard");
   revalidatePath("/dashboard/inventory");
   revalidatePath(`/s/${dealer.store?.slug}/showcase`);
@@ -297,13 +351,15 @@ export async function bulkSetStatus(
 
 export async function bulkDelete(listingIds: string[]): Promise<ListingMutationResult> {
   const { dealer } = await requireDealer({ write: true });
-  const owned = await prisma.listing.findMany({
-    where: { id: { in: listingIds }, dealerId: dealer.id },
-    select: { id: true },
-  });
-  for (const { id } of owned) {
-    await prisma.listing.delete({ where: { id } });
-  }
+  unwrap(
+    await db
+      .from("Listing")
+      .delete()
+      .in("id", listingIds)
+      .eq("dealerId", dealer.id)
+      .select("id"),
+    "bulkDelete",
+  );
   revalidatePath("/dashboard");
   revalidatePath("/dashboard/inventory");
   revalidatePath(`/s/${dealer.store?.slug}/showcase`);

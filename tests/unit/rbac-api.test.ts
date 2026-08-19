@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../../lib/auth", () => ({ auth: vi.fn() }));
-vi.mock("../../lib/db", () => ({
-  prisma: { user: { findUnique: vi.fn() } },
-}));
+vi.mock("../../lib/db", async () => {
+  const { makeDbModule } = await import("../helpers/supabase-mock");
+  return makeDbModule();
+});
 
 import { auth } from "../../lib/auth";
-import { prisma } from "../../lib/db";
+import * as dbModule from "../../lib/db";
+import type { DbMock } from "../helpers/supabase-mock";
 import {
   apiRequireAdmin,
   apiRequireAuth,
@@ -16,7 +18,7 @@ import {
 
 type M = ReturnType<typeof vi.fn>;
 const authMock = auth as unknown as M;
-const userFindUnique = prisma.user.findUnique as unknown as M;
+const dbMock = (dbModule as unknown as { __mock: DbMock }).__mock;
 
 type Row = {
   id: string;
@@ -24,11 +26,15 @@ type Row = {
   dealer: { id: string; status: "ACTIVE" | "SUSPENDED" } | null;
 };
 
+/**
+ * `getAuthContext` re-reads the User row on every gate, so the answer is a
+ * standing default rather than a one-shot queue entry.
+ */
 function signIn(row: Row | null, claimedRole = row?.role) {
   authMock.mockResolvedValue(row ? { user: { id: row.id, role: claimedRole } } : null);
-  userFindUnique.mockResolvedValue(
-    row ? { ...row, email: `${row.id}@example.com`, name: row.id } : null,
-  );
+  dbMock.on("User", {
+    data: row ? { ...row, email: `${row.id}@example.com`, name: row.id } : null,
+  });
 }
 
 const BUYER: Row = { id: "u_buyer", role: "BUYER", dealer: null };
@@ -45,6 +51,7 @@ const SUSPENDED: Row = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  dbMock.reset();
 });
 
 describe("API gates — status codes", () => {

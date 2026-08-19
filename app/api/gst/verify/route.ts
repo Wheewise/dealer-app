@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { apiRequireDealer } from "@/lib/rbac";
-import { prisma } from "@/lib/db";
+import { db, unwrap } from "@/lib/db";
 import { verifyGstin, isValidGstin } from "@/lib/gst";
 
 export async function POST(req: Request) {
@@ -29,13 +29,21 @@ export async function POST(req: Request) {
 
   // Only mark dealer.gstVerified=true when the upstream provider is trusted.
   // Mock/stub results return trusted=false to avoid forged "verified" badges.
-  await prisma.dealer.update({
-    where: { id: gate.ctx.dealerId },
-    data: {
-      gstin: gstin.replace(/\s/g, "").toUpperCase(),
-      ...(result.trusted ? { gstVerified: true } : {}),
-    },
-  });
+  //
+  // This write runs with the service role, which is what lets it past
+  // `guard_dealer_verification_change` — a dealer session cannot set
+  // gstVerified for itself.
+  unwrap(
+    await db
+      .from("Dealer")
+      .update({
+        gstin: gstin.replace(/\s/g, "").toUpperCase(),
+        ...(result.trusted ? { gstVerified: true } : {}),
+      })
+      .eq("id", gate.ctx.dealerId!)
+      .select("id"),
+    "POST /api/gst/verify",
+  );
 
   return NextResponse.json({
     verified: result.trusted,

@@ -11,14 +11,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
  */
 
 vi.mock("../../../lib/auth", () => ({ auth: vi.fn() }));
-vi.mock("../../../lib/db", () => ({
-  prisma: {
-    user: { findUnique: vi.fn() },
-    apiKey: { findFirst: vi.fn(), delete: vi.fn(), create: vi.fn() },
-    enquiry: { count: vi.fn() },
-    listing: { findMany: vi.fn() },
-  },
-}));
+vi.mock("../../../lib/db", async () => {
+  const { makeDbModule } = await import("../../helpers/supabase-mock");
+  return makeDbModule();
+});
 vi.mock("../../../lib/rto", () => ({ fetchRto: vi.fn() }));
 vi.mock("../../../lib/ai-description", () => ({
   generateDescription: vi.fn(),
@@ -26,7 +22,8 @@ vi.mock("../../../lib/ai-description", () => ({
 }));
 
 import { auth } from "../../../lib/auth";
-import { prisma } from "../../../lib/db";
+import * as dbModule from "../../../lib/db";
+import type { DbMock, Operation, RecordedCall } from "../../helpers/supabase-mock";
 import { fetchRto } from "../../../lib/rto";
 
 import { GET as rtoGET } from "../../../app/api/rto/route";
@@ -37,11 +34,11 @@ import { GET as listingsGET } from "../../../app/api/listings/route";
 
 type M = ReturnType<typeof vi.fn>;
 const authMock = auth as unknown as M;
-const userFindUnique = prisma.user.findUnique as unknown as M;
-const apiKeyFindFirst = prisma.apiKey.findFirst as unknown as M;
-const apiKeyDelete = prisma.apiKey.delete as unknown as M;
-const enquiryCount = prisma.enquiry.count as unknown as M;
-const listingFindMany = prisma.listing.findMany as unknown as M;
+const dbMock = (dbModule as unknown as { __mock: DbMock }).__mock;
+
+function callsTo(table: string, operation: Operation): RecordedCall[] {
+  return dbMock.calls.filter((c) => c.table === table && c.operation === operation);
+}
 
 type Row = {
   id: string;
@@ -51,8 +48,8 @@ type Row = {
 
 function signIn(row: Row | null, claimedRole = row?.role) {
   authMock.mockResolvedValue(row ? { user: { id: row.id, role: claimedRole } } : null);
-  userFindUnique.mockResolvedValue(
-    row
+  dbMock.on("User", {
+    data: row
       ? {
           id: row.id,
           email: `${row.id}@example.com`,
@@ -61,7 +58,7 @@ function signIn(row: Row | null, claimedRole = row?.role) {
           dealer: row.dealer ?? null,
         }
       : null,
-  );
+  });
 }
 
 const ANON = null;
@@ -87,8 +84,8 @@ const jsonReq = (url: string, body: unknown, method = "POST") =>
 
 beforeEach(() => {
   vi.clearAllMocks();
-  enquiryCount.mockResolvedValue(7);
-  listingFindMany.mockResolvedValue([]);
+  dbMock.reset();
+  dbMock.on("Enquiry", { count: 7 });
   (fetchRto as unknown as M).mockResolvedValue({ regNumber: "MH12AB1234" });
 });
 
@@ -165,28 +162,29 @@ describe("GET /api/rto — input validation", () => {
 describe("DELETE /api/dealer/api-keys — cross-tenant key deletion", () => {
   it("refuses a key belonging to another dealer", async () => {
     signIn(DEALER_A);
-    // The ownership-scoped lookup finds nothing, because the key is dealer B's.
-    apiKeyFindFirst.mockResolvedValue(null);
+    // The dealerId filter rides on the DELETE, so another dealer's key simply
+    // matches no row and nothing is removed.
+    dbMock.on("ApiKey", { data: [] });
     const res = await apiKeyDELETE(
       new Request("https://x.test/api/dealer/api-keys?id=dealer_B_key", {
         method: "DELETE",
       }),
     );
     expect(res.status).toBe(404);
-    expect(apiKeyDelete).not.toHaveBeenCalled();
   });
 
-  it("scopes the lookup to the caller's own dealer id", async () => {
+  it("scopes the delete to the caller's own dealer id", async () => {
     signIn(DEALER_A);
-    apiKeyFindFirst.mockResolvedValue({ id: "k1", dealerId: "dealer_A" });
-    apiKeyDelete.mockResolvedValue({});
+    dbMock.on("ApiKey", { data: [{ id: "k1" }] });
     await apiKeyDELETE(
       new Request("https://x.test/api/dealer/api-keys?id=k1", { method: "DELETE" }),
     );
-    expect(apiKeyFindFirst).toHaveBeenCalledWith({
-      where: { id: "k1", dealerId: "dealer_A" },
-    });
-    expect(apiKeyDelete).toHaveBeenCalledWith({ where: { id: "k1" } });
+    expect(callsTo("ApiKey", "delete")[0].filters).toEqual(
+      expect.arrayContaining([
+        { method: "eq", args: ["id", "k1"] },
+        { method: "eq", args: ["dealerId", "dealer_A"] },
+      ]),
+    );
   });
 });
 
@@ -195,15 +193,29 @@ describe("GET /api/dealer/leads/unread-count", () => {
     signIn(BUYER);
     const res = await unreadGET();
     expect(await res.json()).toEqual({ count: 0 });
-    expect(enquiryCount).not.toHaveBeenCalled();
+    expect(callsTo("Enquiry", "select")).toHaveLength(0);
   });
 
   it("counts only the caller's own dealer enquiries", async () => {
     signIn(DEALER_A);
     const res = await unreadGET();
     expect(await res.json()).toEqual({ count: 7 });
-    expect(enquiryCount).toHaveBeenCalledWith({
-      where: { dealerId: "dealer_A", isRead: false },
+    expect(callsTo("Enquiry", "select")[0].filters).toEqual(
+      expect.arrayContaining([
+        { method: "eq", args: ["dealerId", "dealer_A"] },
+        { method: "eq", args: ["isRead", false] },
+      ]),
+    );
+  });
+
+  // head: true means PostgREST returns the count header and no rows, so a
+  // dealer's lead volume never travels just to be counted.
+  it("asks for a count without transferring rows", async () => {
+    signIn(DEALER_A);
+    await unreadGET();
+    expect(callsTo("Enquiry", "select")[0].selectOptions).toEqual({
+      count: "exact",
+      head: true,
     });
   });
 });
@@ -214,33 +226,40 @@ describe("GET /api/dealer/leads/unread-count", () => {
  * `dealerId` used verbatim as the filter.
  */
 describe("GET /api/listings — tenant scoping", () => {
-  function whereArg() {
-    return listingFindMany.mock.calls[0][0].where;
+  function listingQuery(): RecordedCall {
+    const call = callsTo("Listing", "select")[0];
+    if (!call) throw new Error("no Listing query was issued");
+    return call;
+  }
+
+  function filters() {
+    return listingQuery().filters;
   }
 
   it("rejects anonymous callers", async () => {
     signIn(ANON);
     const res = await listingsGET(new Request("https://x.test/api/listings"));
     expect(res.status).toBe(401);
-    expect(listingFindMany).not.toHaveBeenCalled();
+    expect(callsTo("Listing", "select")).toHaveLength(0);
   });
 
   it("limits buyers to ACTIVE listings", async () => {
     signIn(BUYER);
     await listingsGET(new Request("https://x.test/api/listings"));
-    expect(whereArg()).toEqual({ status: "ACTIVE" });
+    expect(filters()).toContainEqual({ method: "eq", args: ["status", "ACTIVE"] });
   });
 
   it("does not expose enquiry counts to buyers", async () => {
     signIn(BUYER);
     await listingsGET(new Request("https://x.test/api/listings"));
-    expect(listingFindMany.mock.calls[0][0].include._count).toBeUndefined();
+    expect(listingQuery().select).not.toContain("Enquiry(count)");
   });
 
   it("pins a dealer to their own inventory, ignoring the query string", async () => {
     signIn(DEALER_A);
     await listingsGET(new Request("https://x.test/api/listings"));
-    expect(whereArg()).toEqual({ dealerId: "dealer_A" });
+    expect(filters()).toContainEqual({ method: "eq", args: ["dealerId", "dealer_A"] });
+    expect(filters()).not.toContainEqual({ method: "eq", args: ["status", "ACTIVE"] });
   });
 
   it("refuses a dealer asking for a rival dealer's inventory", async () => {
@@ -249,7 +268,7 @@ describe("GET /api/listings — tenant scoping", () => {
       new Request("https://x.test/api/listings?dealerId=dealer_B"),
     );
     expect(res.status).toBe(403);
-    expect(listingFindMany).not.toHaveBeenCalled();
+    expect(callsTo("Listing", "select")).toHaveLength(0);
   });
 
   it("lets a dealer pass their own id explicitly", async () => {
@@ -258,26 +277,39 @@ describe("GET /api/listings — tenant scoping", () => {
       new Request("https://x.test/api/listings?dealerId=dealer_A"),
     );
     expect(res.status).toBe(200);
-    expect(whereArg()).toEqual({ dealerId: "dealer_A" });
+    expect(filters()).toContainEqual({ method: "eq", args: ["dealerId", "dealer_A"] });
   });
 
   it("lets admins filter across dealers", async () => {
     signIn(ADMIN);
     await listingsGET(new Request("https://x.test/api/listings?dealerId=dealer_B"));
-    expect(whereArg()).toEqual({ dealerId: "dealer_B" });
+    expect(filters()).toContainEqual({ method: "eq", args: ["dealerId", "dealer_B"] });
   });
 
   it("clamps a hostile limit instead of honouring it", async () => {
     signIn(BUYER);
     await listingsGET(new Request("https://x.test/api/listings?limit=100000"));
-    expect(listingFindMany.mock.calls[0][0].take).toBe(51);
+    expect(listingQuery().limit).toBe(51);
 
-    listingFindMany.mockClear();
+    dbMock.reset();
+    signIn(BUYER);
     await listingsGET(new Request("https://x.test/api/listings?limit=-5"));
-    expect(listingFindMany.mock.calls[0][0].take).toBe(2);
+    expect(listingQuery().limit).toBe(2);
 
-    listingFindMany.mockClear();
+    dbMock.reset();
+    signIn(BUYER);
     await listingsGET(new Request("https://x.test/api/listings?limit=abc"));
-    expect(listingFindMany.mock.calls[0][0].take).toBe(21);
+    expect(listingQuery().limit).toBe(21);
+  });
+
+  // A cursor is an opaque base64 of the sort key, so a malformed one restarts
+  // from the first page rather than 500ing.
+  it("ignores a malformed cursor", async () => {
+    signIn(BUYER);
+    const res = await listingsGET(
+      new Request("https://x.test/api/listings?cursor=not-a-cursor"),
+    );
+    expect(res.status).toBe(200);
+    expect(filters().some((f) => f.method === "or")).toBe(false);
   });
 });

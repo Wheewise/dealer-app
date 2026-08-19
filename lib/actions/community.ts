@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { db, embeddedCount, unwrap, unwrapMaybe } from "@/lib/db";
 import { moderateContent } from "@/lib/moderation";
 import { getAuthContext, requireAdminContext, type Permission } from "@/lib/rbac";
 
@@ -53,15 +53,20 @@ export async function createPost(
     };
   }
 
-  await prisma.post.create({
-    data: {
-      title: parsed.data.title,
-      body: parsed.data.body,
-      authorId: session.user.id,
-      community: parsed.data.community,
-      tags: parsed.data.tags,
-    },
-  });
+  unwrap(
+    await db
+      .from("Post")
+      .insert({
+        title: parsed.data.title,
+        body: parsed.data.body,
+        authorId: session.user.id,
+        community: parsed.data.community,
+        tags: parsed.data.tags,
+      })
+      .select("id")
+      .single(),
+    "createPost",
+  );
 
   const path = community === "DEALER" ? "/forum/dealer" : "/community";
   revalidatePath(path);
@@ -76,7 +81,7 @@ export async function createPost(
  * the community page — or who called this action directly. Admin moderation
  * (`getAllPosts`) still sees emails; public reads do not.
  */
-const PUBLIC_AUTHOR = { select: { name: true } } as const;
+const PUBLIC_AUTHOR = "author:User(name)";
 
 /** Only dealers (and admins) may read the dealer forum. */
 async function canReadDealerForum(): Promise<boolean> {
@@ -90,34 +95,50 @@ export async function getPosts(community: "BUYER" | "DEALER") {
   // invoking it directly.
   if (community === "DEALER" && !(await canReadDealerForum())) return [];
 
-  return prisma.post.findMany({
-    where: { community },
-    include: {
-      author: PUBLIC_AUTHOR,
-      _count: { select: { replies: true, upvotes: true } },
-    },
-    orderBy: [{ isPinned: "desc" }, { createdAt: "desc" }],
-  });
+  const rows = unwrap(
+    await db
+      .from("Post")
+      .select(`*, ${PUBLIC_AUTHOR}, replies:Reply(count), upvotes:PostUpvote(count)`)
+      .eq("community", community)
+      .order("isPinned", { ascending: false })
+      .order("createdAt", { ascending: false }),
+    "getPosts",
+  );
+
+  return rows.map((p) => ({
+    ...p,
+    _count: { replies: embeddedCount(p.replies), upvotes: embeddedCount(p.upvotes) },
+  }));
 }
 
 export async function getPost(postId: string) {
-  const post = await prisma.post.findUnique({
-    where: { id: postId },
-    include: {
-      author: PUBLIC_AUTHOR,
-      _count: { select: { upvotes: true } },
-      replies: {
-        include: { author: PUBLIC_AUTHOR },
-        orderBy: { createdAt: "asc" },
-      },
-    },
-  });
+  const post = unwrapMaybe(
+    await db
+      .from("Post")
+      .select(
+        `*, ${PUBLIC_AUTHOR},
+         upvotes:PostUpvote(count),
+         replies:Reply(*, author:User(name))`,
+      )
+      .eq("id", postId)
+      .maybeSingle(),
+    "getPost",
+  );
 
   if (!post) return null;
   // Same rule as the list: a dealer-forum thread is not public. Null rather
   // than a distinct error, so the id is not confirmed to a stranger.
   if (post.community === "DEALER" && !(await canReadDealerForum())) return null;
-  return post;
+
+  // PostgREST cannot order an embed per parent row; replies read oldest-first.
+  // ISO-8601 sorts correctly as text, so no Date objects are needed.
+  const replies = [...post.replies].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+  return {
+    ...post,
+    replies,
+    _count: { upvotes: embeddedCount(post.upvotes) },
+  };
 }
 
 export async function createReply(postId: string, body: string) {
@@ -133,10 +154,14 @@ export async function createReply(postId: string, body: string) {
     };
   }
 
-  const post = await prisma.post.findUnique({
-    where: { id: parsed.data.postId },
-    select: { isLocked: true, community: true },
-  });
+  const post = unwrapMaybe(
+    await db
+      .from("Post")
+      .select("isLocked, community")
+      .eq("id", parsed.data.postId)
+      .maybeSingle(),
+    "createReply lookup",
+  );
   if (!post) return { ok: false as const, error: "Post not found" };
   if (post.isLocked) return { ok: false as const, error: "This discussion is locked" };
   if (post.community === "DEALER" && session.user.role !== "DEALER") {
@@ -154,13 +179,18 @@ export async function createReply(postId: string, body: string) {
     };
   }
 
-  await prisma.reply.create({
-    data: {
-      postId: parsed.data.postId,
-      authorId: session.user.id,
-      body: parsed.data.body,
-    },
-  });
+  unwrap(
+    await db
+      .from("Reply")
+      .insert({
+        postId: parsed.data.postId,
+        authorId: session.user.id,
+        body: parsed.data.body,
+      })
+      .select("id")
+      .single(),
+    "createReply",
+  );
 
   const path =
     post.community === "DEALER"
@@ -174,24 +204,37 @@ export async function upvotePost(postId: string) {
   const session = await auth();
   if (!session?.user?.id) throw new Error("Unauthorized");
 
-  const post = await prisma.post.findUnique({
-    where: { id: postId },
-    select: { community: true },
-  });
+  const post = unwrapMaybe(
+    await db.from("Post").select("community").eq("id", postId).maybeSingle(),
+    "upvotePost lookup",
+  );
   if (!post) throw new Error("Post not found");
   if (post.community === "DEALER" && session.user.role !== "DEALER") {
     throw new Error("Only dealers can vote in the dealer forum");
   }
 
-  const existing = await prisma.postUpvote.findUnique({
-    where: { postId_userId: { postId, userId: session.user.id } },
-  });
-  if (existing) {
-    await prisma.postUpvote.delete({ where: { id: existing.id } });
-  } else {
-    await prisma.postUpvote.create({
-      data: { postId, userId: session.user.id },
-    });
+  // Toggle. The unique index on (postId, userId) is what keeps a double-click
+  // from producing two upvotes if both requests read "not upvoted".
+  const deleted = unwrap(
+    await db
+      .from("PostUpvote")
+      .delete()
+      .eq("postId", postId)
+      .eq("userId", session.user.id)
+      .select("id"),
+    "upvotePost: remove",
+  );
+  if (deleted.length === 0) {
+    unwrap(
+      await db
+        .from("PostUpvote")
+        .upsert(
+          { postId, userId: session.user.id },
+          { onConflict: "postId,userId", ignoreDuplicates: true },
+        )
+        .select("id"),
+      "upvotePost: add",
+    );
   }
 
   revalidatePath(`/community/${postId}`);
@@ -203,47 +246,60 @@ export async function upvotePost(postId: string) {
 
 export async function togglePinPost(postId: string) {
   await requireAdmin("update");
-  const post = await prisma.post.findUnique({
-    where: { id: postId },
-    select: { isPinned: true },
-  });
+  const post = unwrapMaybe(
+    await db.from("Post").select("isPinned").eq("id", postId).maybeSingle(),
+    "togglePinPost lookup",
+  );
   if (!post) return;
-  await prisma.post.update({
-    where: { id: postId },
-    data: { isPinned: !post.isPinned },
-  });
+  unwrap(
+    await db
+      .from("Post")
+      .update({ isPinned: !post.isPinned })
+      .eq("id", postId)
+      .select("id"),
+    "togglePinPost",
+  );
   revalidatePath("/admin/community");
 }
 
 export async function toggleLockPost(postId: string) {
   await requireAdmin("update");
-  const post = await prisma.post.findUnique({
-    where: { id: postId },
-    select: { isLocked: true },
-  });
+  const post = unwrapMaybe(
+    await db.from("Post").select("isLocked").eq("id", postId).maybeSingle(),
+    "toggleLockPost lookup",
+  );
   if (!post) return;
-  await prisma.post.update({
-    where: { id: postId },
-    data: { isLocked: !post.isLocked },
-  });
+  unwrap(
+    await db
+      .from("Post")
+      .update({ isLocked: !post.isLocked })
+      .eq("id", postId)
+      .select("id"),
+    "toggleLockPost",
+  );
   revalidatePath("/admin/community");
 }
 
 export async function deletePost(postId: string) {
   await requireAdmin("delete");
-  await prisma.post.delete({ where: { id: postId } });
+  unwrap(await db.from("Post").delete().eq("id", postId).select("id"), "deletePost");
   revalidatePath("/admin/community");
 }
 
 export async function getAllPosts() {
   await requireAdmin("read");
-  return prisma.post.findMany({
-    include: {
-      author: { select: { name: true, email: true } },
-      _count: { select: { replies: true, upvotes: true } },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  const rows = unwrap(
+    await db
+      .from("Post")
+      .select("*, author:User(name, email), replies:Reply(count), upvotes:PostUpvote(count)")
+      .order("createdAt", { ascending: false }),
+    "getAllPosts",
+  );
+
+  return rows.map((p) => ({
+    ...p,
+    _count: { replies: embeddedCount(p.replies), upvotes: embeddedCount(p.upvotes) },
+  }));
 }
 
 // Delegates to the central RBAC guard. The previous local copy compared

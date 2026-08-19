@@ -1,12 +1,17 @@
-import { prisma } from "./db";
+import { db, unwrapMaybe } from "./db";
 
 export async function renderTemplate(
   name: string,
   vars: Record<string, string>,
 ): Promise<{ subject: string; body: string } | null> {
-  const template = await prisma.notificationTemplate.findUnique({
-    where: { name },
-  });
+  const template = unwrapMaybe(
+    await db
+      .from("NotificationTemplate")
+      .select("subject, body")
+      .eq("name", name)
+      .maybeSingle(),
+    "renderTemplate",
+  );
   if (!template) return null;
 
   let subject = template.subject;

@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { Prisma } from "@prisma/client";
-import { prisma } from "@/lib/db";
+import { db, isUniqueViolation, unwrap } from "@/lib/db";
 import { verifyWebhookSignature, type RazorpayWebhookEvent } from "@/lib/razorpay";
 
 const STATUS_MAP: Record<string, "ACTIVE" | "PAST_DUE" | "CANCELLED" | "TRIALING"> = {
@@ -31,22 +30,21 @@ export async function POST(req: Request) {
   }
 
   // Replay protection — see /api/webhooks/razorpay for the same pattern.
+  // Payment_razorpayEventId_key is what enforces it: a redelivered event
+  // violates the index (23505) and is acked without re-processing.
   if (event.id) {
-    try {
-      await prisma.payment.create({
-        data: {
-          razorpayEventId: event.id,
-          kind: "WEBHOOK",
-          amount: 0,
-          status: "SUCCEEDED",
-          notes: { event: event.event, route: "billing/webhook" },
-        },
-      });
-    } catch (err) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+    const { error } = await db.from("Payment").insert({
+      razorpayEventId: event.id,
+      kind: "WEBHOOK",
+      amount: 0,
+      status: "SUCCEEDED",
+      notes: { event: event.event, route: "billing/webhook" },
+    });
+    if (error) {
+      if (isUniqueViolation(error)) {
         return NextResponse.json({ ok: true, replayed: true });
       }
-      throw err;
+      throw new Error(error.message);
     }
   }
 
@@ -56,22 +54,21 @@ export async function POST(req: Request) {
   const mapped = STATUS_MAP[sub.status];
   if (!mapped) return NextResponse.json({ ok: true });
 
-  // updateMany runs as a multi-statement transaction, which the Cloudflare
-  // Workers Neon HTTP adapter can't do (see lib/db.ts) — find the row by
-  // its unique razorpaySubId, then update it directly.
-  const existing = await prisma.subscription.findUnique({
-    where: { razorpaySubId: sub.id },
-    select: { id: true },
-  });
-  if (existing) {
-    await prisma.subscription.update({
-      where: { id: existing.id },
-      data: {
+  // Filtering on the unique razorpaySubId is the whole scope: an unknown
+  // subscription id matches nothing and the webhook is still acked.
+  unwrap(
+    await db
+      .from("Subscription")
+      .update({
         status: mapped,
-        ...(sub.current_end ? { currentPeriodEnd: new Date(sub.current_end * 1000) } : {}),
-      },
-    });
-  }
+        ...(sub.current_end
+          ? { currentPeriodEnd: new Date(sub.current_end * 1000).toISOString() }
+          : {}),
+      })
+      .eq("razorpaySubId", sub.id)
+      .select("id"),
+    "billing/webhook: subscription status",
+  );
 
   return NextResponse.json({ ok: true });
 }

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { apiRequireDealer } from "@/lib/rbac";
-import { prisma } from "@/lib/db";
+import { db, unwrap } from "@/lib/db";
 import { listingSchema } from "@/lib/validators/listing";
 
 const HEADERS = [
@@ -38,10 +38,10 @@ export async function POST(req: Request) {
 
   // `city` is the only extra field needed; the id comes from the session
   // context, never from the request.
-  const dealer = await prisma.dealer.findUniqueOrThrow({
-    where: { id: gate.ctx.dealerId },
-    select: { id: true, city: true },
-  });
+  const dealer = unwrap(
+    await db.from("Dealer").select("id, city").eq("id", gate.ctx.dealerId!).single(),
+    "bulk-upload: dealer",
+  );
 
   // Reject oversized uploads before reading body to avoid memory pressure.
   // 1 MB easily covers the 100-row cap (template row is ~120 bytes).
@@ -106,7 +106,9 @@ export async function POST(req: Request) {
         continue;
       }
 
-      const { description, ...data } = parsed.data;
+      // `photoUrls` belongs to the form schema, not the Listing table — the
+      // CSV path never supplies photos, and PostgREST rejects unknown columns.
+      const { description, photoUrls: _photoUrls, ...data } = parsed.data;
       const { ensureDescription } = await import("@/lib/ai-description");
       const finalDescription = await ensureDescription(description, {
         vehicleType: data.vehicleType,
@@ -120,14 +122,19 @@ export async function POST(req: Request) {
         city: data.city,
       });
 
-      const listing = await prisma.listing.create({
-        data: {
-          ...data,
-          description: finalDescription,
-          dealerId: dealer.id,
-          status: "ACTIVE",
-        },
-      });
+      const listing = unwrap(
+        await db
+          .from("Listing")
+          .insert({
+            ...data,
+            description: finalDescription,
+            dealerId: dealer.id,
+            status: "ACTIVE",
+          })
+          .select("id")
+          .single(),
+        "bulk-upload: listing",
+      );
 
       results.push({ row: rowNum, id: listing.id });
     } catch (err) {

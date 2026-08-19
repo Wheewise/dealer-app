@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { apiRequireDealer } from "@/lib/rbac";
-import { prisma } from "@/lib/db";
+import { db, unwrap } from "@/lib/db";
 import { generateApiKey, hashApiKey, keyPrefixOf } from "@/lib/api-auth";
 
 export async function POST(req: Request) {
@@ -20,14 +20,19 @@ export async function POST(req: Request) {
   }
 
   const plaintext = generateApiKey();
-  const apiKey = await prisma.apiKey.create({
-    data: {
-      dealerId: dealer.id,
-      name: name.trim(),
-      keyHash: hashApiKey(plaintext),
-      keyPrefix: keyPrefixOf(plaintext),
-    },
-  });
+  const apiKey = unwrap(
+    await db
+      .from("ApiKey")
+      .insert({
+        dealerId: dealer.id,
+        name: name.trim(),
+        keyHash: hashApiKey(plaintext),
+        keyPrefix: keyPrefixOf(plaintext),
+      })
+      .select("id, name, keyPrefix, lastUsedAt, createdAt")
+      .single(),
+    "POST /api/dealer/api-keys",
+  );
 
   // Plaintext is returned exactly once. It is NEVER persisted. The dealer
   // must copy it now; subsequent GETs only surface the prefix.
@@ -52,16 +57,20 @@ export async function DELETE(req: Request) {
     return NextResponse.json({ error: "id is required" }, { status: 400 });
   }
 
-  const key = await prisma.apiKey.findFirst({
-    where: { id, dealerId: dealer.id },
-  });
-  if (!key) {
+  // The dealerId filter rides on the delete itself, so the client-supplied
+  // `id` never selects a row on its own.
+  const deleted = unwrap(
+    await db
+      .from("ApiKey")
+      .delete()
+      .eq("id", id)
+      .eq("dealerId", dealer.id)
+      .select("id"),
+    "DELETE /api/dealer/api-keys",
+  );
+  if (deleted.length === 0) {
     return NextResponse.json({ error: "Key not found" }, { status: 404 });
   }
-
-  // Delete by the row we just proved is ours, so the client-supplied `id`
-  // never reaches the delete on its own.
-  await prisma.apiKey.delete({ where: { id: key.id } });
 
   return NextResponse.json({ ok: true });
 }

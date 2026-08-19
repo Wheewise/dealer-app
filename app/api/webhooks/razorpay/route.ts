@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { Prisma } from "@prisma/client";
-import { prisma } from "@/lib/db";
+import { db, isUniqueViolation, unwrap } from "@/lib/db";
 import { verifyWebhookSignature } from "@/lib/razorpay";
 
 export async function POST(req: Request) {
@@ -26,59 +25,52 @@ export async function POST(req: Request) {
       };
     };
 
-    // Replay protection: insert Payment row keyed by webhook event id.
-    // Razorpay event ids are unique per delivery; a replay hits P2002 and we
-    // ack the webhook silently without re-processing.
+    // Replay protection: insert a Payment row keyed by the webhook event id.
+    // Razorpay event ids are unique per delivery, so a redelivery violates
+    // Payment_razorpayEventId_key (23505) and we ack silently without
+    // re-processing.
     if (event.id) {
-      try {
-        await prisma.payment.create({
-          data: {
-            razorpayEventId: event.id,
-            kind: "WEBHOOK",
-            amount: 0,
-            status: "SUCCEEDED",
-            notes: { event: event.event },
-          },
-        });
-      } catch (err) {
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      const { error } = await db.from("Payment").insert({
+        razorpayEventId: event.id,
+        kind: "WEBHOOK",
+        amount: 0,
+        status: "SUCCEEDED",
+        notes: { event: event.event },
+      });
+      if (error) {
+        if (isUniqueViolation(error)) {
           return NextResponse.json({ received: true, replayed: true });
         }
-        throw err;
+        throw new Error(error.message);
       }
     }
 
-    // updateMany runs as a multi-statement transaction, which the
-    // Cloudflare Workers Neon HTTP adapter can't do (see lib/db.ts) — find
-    // the row by its unique razorpaySubId, then update it directly.
+    // Filtering on the unique razorpaySubId is the whole scope: an unknown
+    // subscription id matches nothing and the webhook is still acked.
     if (event.event === "subscription.charged" && event.payload.subscription) {
       const sub = event.payload.subscription.entity;
-      const existing = await prisma.subscription.findUnique({
-        where: { razorpaySubId: sub.id },
-        select: { id: true },
-      });
-      if (existing) {
-        await prisma.subscription.update({
-          where: { id: existing.id },
-          data: {
+      unwrap(
+        await db
+          .from("Subscription")
+          .update({
             status: "ACTIVE",
             ...(sub.current_end
-              ? { currentPeriodEnd: new Date(sub.current_end * 1000) }
+              ? { currentPeriodEnd: new Date(sub.current_end * 1000).toISOString() }
               : {}),
-          },
-        });
-      }
+          })
+          .eq("razorpaySubId", sub.id)
+          .select("id"),
+        "razorpay webhook: charged",
+      );
     } else if (event.event === "subscription.cancelled" && event.payload.subscription) {
-      const existing = await prisma.subscription.findUnique({
-        where: { razorpaySubId: event.payload.subscription.entity.id },
-        select: { id: true },
-      });
-      if (existing) {
-        await prisma.subscription.update({
-          where: { id: existing.id },
-          data: { status: "CANCELLED" },
-        });
-      }
+      unwrap(
+        await db
+          .from("Subscription")
+          .update({ status: "CANCELLED" })
+          .eq("razorpaySubId", event.payload.subscription.entity.id)
+          .select("id"),
+        "razorpay webhook: cancelled",
+      );
     }
 
     return NextResponse.json({ received: true });

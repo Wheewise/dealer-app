@@ -4,7 +4,7 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { db, isUniqueViolation, unwrapMaybe } from "@/lib/db";
 
 const updateProfileSchema = z.object({
   name: z.string().min(2, "Name is too short"),
@@ -43,23 +43,37 @@ export async function updateProfile(
   }
 
   const normalizedPhone = normalizePhone(parsed.data.phone);
-  const conflict = await prisma.user.findFirst({
-    where: { phone: normalizedPhone, NOT: { id: session.user.id } },
-    select: { id: true },
-  });
+  const conflict = unwrapMaybe(
+    await db
+      .from("User")
+      .select("id")
+      .eq("phone", normalizedPhone)
+      .neq("id", session.user.id)
+      .limit(1)
+      .maybeSingle(),
+    "updateProfile: phone conflict",
+  );
   if (conflict) {
     return { ok: false, errors: { phone: ["Phone number already in use"] } };
   }
 
-  await prisma.user.update({
-    where: { id: session.user.id },
-    data: {
+  // The check above races; User_phone_key is what actually decides, so a
+  // concurrent claim of the same number surfaces as a field error.
+  const { error } = await db
+    .from("User")
+    .update({
       name: parsed.data.name,
       phone: normalizedPhone,
       district: parsed.data.district,
       state: parsed.data.state,
-    },
-  });
+    })
+    .eq("id", session.user.id);
+  if (error) {
+    if (isUniqueViolation(error)) {
+      return { ok: false, errors: { phone: ["Phone number already in use"] } };
+    }
+    throw new Error(error.message);
+  }
 
   revalidatePath("/profile");
   redirect("/profile");

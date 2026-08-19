@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { prisma } from "./db";
+import { db, unwrapMaybe } from "./db";
 
 /** Returns the SHA-256 hex of an API key plaintext. */
 export function hashApiKey(plaintext: string): string {
@@ -43,35 +43,43 @@ export async function validateApiKey(req: Request): Promise<string | null> {
 
   const hash = hashApiKey(plaintext);
 
-  const byHash = await prisma.apiKey.findUnique({
-    where: { keyHash: hash },
-    select: { id: true, dealerId: true },
-  });
+  const byHash = unwrapMaybe(
+    await db.from("ApiKey").select("id, dealerId").eq("keyHash", hash).maybeSingle(),
+    "apiKey: lookup by hash",
+  );
   if (byHash) {
-    prisma.apiKey
-      .update({ where: { id: byHash.id }, data: { lastUsedAt: new Date() } })
-      .catch(() => {});
+    // Fire-and-forget: a failed lastUsedAt stamp must not fail the request.
+    void db
+      .from("ApiKey")
+      .update({ lastUsedAt: new Date().toISOString() })
+      .eq("id", byHash.id)
+      .then(() => undefined, () => undefined);
     return byHash.dealerId;
   }
 
   // Legacy plaintext lookup. Only matches keys that pre-date the hash column.
-  const byPlain = await prisma.apiKey.findFirst({
-    where: { key: plaintext, keyHash: null },
-    select: { id: true, dealerId: true },
-  });
+  const byPlain = unwrapMaybe(
+    await db
+      .from("ApiKey")
+      .select("id, dealerId")
+      .eq("key", plaintext)
+      .is("keyHash", null)
+      .limit(1)
+      .maybeSingle(),
+    "apiKey: legacy lookup",
+  );
   if (!byPlain) return null;
 
   // Silent backfill — future requests hit the hash path.
-  prisma.apiKey
+  void db
+    .from("ApiKey")
     .update({
-      where: { id: byPlain.id },
-      data: {
-        keyHash: hash,
-        keyPrefix: keyPrefixOf(plaintext),
-        lastUsedAt: new Date(),
-      },
+      keyHash: hash,
+      keyPrefix: keyPrefixOf(plaintext),
+      lastUsedAt: new Date().toISOString(),
     })
-    .catch(() => {});
+    .eq("id", byPlain.id)
+    .then(() => undefined, () => undefined);
 
   return byPlain.dealerId;
 }

@@ -3,11 +3,22 @@
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { auth } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { db, unwrap, unwrapMaybe } from "@/lib/db";
 import { requireDealer } from "@/lib/dealer";
-import { NBFC } from "@prisma/client";
+import type { NBFC } from "@/types/supabase";
 
-const NBFC_VALUES = Object.values(NBFC) as [NBFC, ...NBFC[]];
+const NBFC_VALUES = [
+  "BAJAJ_FINSERV",
+  "HDFC_BANK",
+  "ICICI_BANK",
+  "MAHINDRA_FINANCE",
+  "KOTAK_MAHINDRA",
+  "CHOLAMANDALAM",
+  "SHRIRAM_FINANCE",
+  "SUNDARAM_FINANCE",
+  "TATA_CAPITAL",
+  "OTHER",
+] as const satisfies readonly NBFC[];
 
 // PAN format: 5 letters + 4 digits + 1 letter
 const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
@@ -52,10 +63,14 @@ export async function applyForLoan(input: ApplyForLoanInput) {
   }
   const data = parsed.data;
 
-  const listing = await prisma.listing.findUnique({
-    where: { id: data.listingId },
-    select: { id: true, status: true, askingPrice: true, dealerId: true },
-  });
+  const listing = unwrapMaybe(
+    await db
+      .from("Listing")
+      .select("id, status, askingPrice, dealerId")
+      .eq("id", data.listingId)
+      .maybeSingle(),
+    "applyForLoan: listing",
+  );
   if (!listing || listing.status !== "ACTIVE") {
     return { ok: false as const, error: "Listing not available" };
   }
@@ -75,20 +90,25 @@ export async function applyForLoan(input: ApplyForLoanInput) {
     (Math.pow(1 + monthlyRate, data.tenureMonths) - 1);
   const monthlyEmi = Math.round(emi * 100) / 100;
 
-  await prisma.loanApplication.create({
-    data: {
-      listingId: data.listingId,
-      buyerId: session.user.id,
-      nbfc: data.nbfc,
-      amount: data.amount,
-      tenureMonths: data.tenureMonths,
-      monthlyEmi,
-      applicantName: data.applicantName,
-      applicantPhone: data.applicantPhone,
-      applicantPan: data.applicantPan?.length ? data.applicantPan : null,
-      notes: data.notes ?? null,
-    },
-  });
+  unwrap(
+    await db
+      .from("LoanApplication")
+      .insert({
+        listingId: data.listingId,
+        buyerId: session.user.id,
+        nbfc: data.nbfc,
+        amount: data.amount,
+        tenureMonths: data.tenureMonths,
+        monthlyEmi,
+        applicantName: data.applicantName,
+        applicantPhone: data.applicantPhone,
+        applicantPan: data.applicantPan?.length ? data.applicantPan : null,
+        notes: data.notes ?? null,
+      })
+      .select("id")
+      .single(),
+    "applyForLoan",
+  );
 
   revalidatePath(`/vehicle/${data.listingId}`);
   return { ok: true as const, emi: monthlyEmi };
@@ -98,23 +118,36 @@ export async function getLoanApplications(listingId: string) {
   const session = await auth();
   if (!session?.user?.id) throw new Error("Unauthorized");
 
-  return prisma.loanApplication.findMany({
-    where: { listingId, buyerId: session.user.id },
-    orderBy: { createdAt: "desc" },
-  });
+  return unwrap(
+    await db
+      .from("LoanApplication")
+      .select("*")
+      .eq("listingId", listingId)
+      .eq("buyerId", session.user.id)
+      .order("createdAt", { ascending: false }),
+    "getLoanApplications",
+  );
 }
 
 export async function getDealerLoanApplications() {
   const { dealer } = await requireDealer();
 
-  return prisma.loanApplication.findMany({
-    where: { listing: { dealerId: dealer.id } },
-    include: {
-      buyer: { select: { name: true, email: true, phone: true } },
-      listing: { select: { make: true, model: true, year: true } },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  // `!inner` makes the Listing embed a join rather than a left join, so the
+  // dealerId filter on it actually restricts which loans come back.
+  const rows = unwrap(
+    await db
+      .from("LoanApplication")
+      .select(
+        `*,
+         buyer:User(name, email, phone),
+         listing:Listing!inner(make, model, year, dealerId)`,
+      )
+      .eq("listing.dealerId", dealer.id)
+      .order("createdAt", { ascending: false }),
+    "getDealerLoanApplications",
+  );
+
+  return rows;
 }
 
 export async function updateLoanStatus(
@@ -123,18 +156,21 @@ export async function updateLoanStatus(
 ) {
   const { dealer } = await requireDealer({ write: true });
 
-  const loan = await prisma.loanApplication.findUnique({
-    where: { id: loanId },
-    select: { listing: { select: { dealerId: true } } },
-  });
-  if (!loan || loan.listing.dealerId !== dealer.id) {
-    throw new Error("Loan not found");
-  }
+  const loan = unwrapMaybe(
+    await db
+      .from("LoanApplication")
+      .select("id, listing:Listing!inner(dealerId)")
+      .eq("id", loanId)
+      .eq("listing.dealerId", dealer.id)
+      .maybeSingle(),
+    "updateLoanStatus lookup",
+  );
+  if (!loan) throw new Error("Loan not found");
 
-  await prisma.loanApplication.update({
-    where: { id: loanId },
-    data: { status },
-  });
+  unwrap(
+    await db.from("LoanApplication").update({ status }).eq("id", loanId).select("id"),
+    "updateLoanStatus",
+  );
   revalidatePath("/dashboard/loans");
 }
 
@@ -145,18 +181,20 @@ export async function updateListingInsurance(
 ) {
   const { dealer } = await requireDealer({ write: true });
 
-  const listing = await prisma.listing.findFirst({
-    where: { id: listingId, dealerId: dealer.id },
-    select: { id: true },
-  });
-  if (!listing) {
-    throw new Error("Listing not found");
-  }
+  const updated = unwrap(
+    await db
+      .from("Listing")
+      .update({
+        insuranceProvider: provider,
+        insuranceExpiry: new Date(expiry).toISOString(),
+      })
+      .eq("id", listingId)
+      .eq("dealerId", dealer.id)
+      .select("id"),
+    "updateListingInsurance",
+  );
+  if (updated.length === 0) throw new Error("Listing not found");
 
-  await prisma.listing.update({
-    where: { id: listingId },
-    data: { insuranceProvider: provider, insuranceExpiry: new Date(expiry) },
-  });
   revalidatePath("/dashboard/inventory");
   return { ok: true };
 }

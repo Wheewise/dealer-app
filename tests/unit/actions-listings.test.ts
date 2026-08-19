@@ -1,20 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 vi.mock("../../lib/auth", () => ({ auth: vi.fn() }));
-vi.mock("../../lib/db", () => ({
-  prisma: {
-    // getAuthContext() re-reads role + dealer scope from the database rather
-    // than trusting the JWT claim, so the user row is on the guard path of
-    // every dealer action.
-    user: { findUnique: vi.fn() },
-    dealer: { findUnique: vi.fn() },
-    listing: {
-      findFirst: vi.fn(),
-      update: vi.fn(),
-      delete: vi.fn(),
-    },
-  },
-}));
+vi.mock("../../lib/db", async () => {
+  const { makeDbModule } = await import("../helpers/supabase-mock");
+  return makeDbModule();
+});
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 vi.mock("next/navigation", () => ({
   redirect: vi.fn((to: string) => {
@@ -24,15 +14,12 @@ vi.mock("next/navigation", () => ({
 
 import { setListingStatus, deleteListing } from "../../lib/actions/listings";
 import { auth } from "../../lib/auth";
-import { prisma } from "../../lib/db";
+import * as dbModule from "../../lib/db";
+import type { DbMock, RecordedCall } from "../helpers/supabase-mock";
 
 type M = ReturnType<typeof vi.fn>;
 const authMock = auth as unknown as M;
-const userFindUnique = prisma.user.findUnique as unknown as M;
-const dealerFindUnique = prisma.dealer.findUnique as unknown as M;
-const listingFindFirst = prisma.listing.findFirst as unknown as M;
-const listingUpdate = prisma.listing.update as unknown as M;
-const listingDelete = prisma.listing.delete as unknown as M;
+const dbMock = (dbModule as unknown as { __mock: DbMock }).__mock;
 
 /** The signed-in dealer, as the database sees them. */
 function dealerUserRow(status: "ACTIVE" | "SUSPENDED" = "ACTIVE") {
@@ -45,24 +32,37 @@ function dealerUserRow(status: "ACTIVE" | "SUSPENDED" = "ACTIVE") {
   };
 }
 
-beforeEach(() => {
-  vi.clearAllMocks();
-  authMock.mockResolvedValue({ user: { id: "user_A", role: "DEALER" } });
-  userFindUnique.mockResolvedValue(dealerUserRow());
-  dealerFindUnique.mockResolvedValue({
+function dealerRow(overrides: Record<string, unknown> = {}) {
+  return {
     id: "dealer_A",
+    userId: "user_A",
     status: "ACTIVE",
     store: { slug: "a" },
     subscription: {
       status: "ACTIVE",
-      currentPeriodEnd: new Date(Date.now() + 86_400_000),
+      currentPeriodEnd: new Date(Date.now() + 86_400_000).toISOString(),
     },
-  });
-  // The ownership-scoped lookup finds the row by default; individual tests
-  // null it out to simulate "belongs to another dealer".
-  listingFindFirst.mockResolvedValue({ id: "listing_X" });
-  listingUpdate.mockResolvedValue({});
-  listingDelete.mockResolvedValue({});
+    ...overrides,
+  };
+}
+
+/** Writes against Listing — the statements whose filters carry the scoping. */
+function listingWrites(operation: "update" | "delete"): RecordedCall[] {
+  return dbMock.calls.filter((c) => c.table === "Listing" && c.operation === operation);
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  dbMock.reset();
+  authMock.mockResolvedValue({ user: { id: "user_A", role: "DEALER" } });
+  // getAuthContext() re-reads role + dealer scope from the database rather
+  // than trusting the JWT claim, so the User row is on the guard path of
+  // every dealer action.
+  dbMock.on("User", { data: dealerUserRow() });
+  dbMock.on("Dealer", { data: dealerRow() });
+  // The scoped write matches one row by default; individual tests return an
+  // empty array to simulate "belongs to another dealer".
+  dbMock.on("Listing", { data: [{ id: "listing_X" }] });
 });
 
 afterEach(() => {
@@ -70,97 +70,86 @@ afterEach(() => {
 });
 
 describe("setListingStatus — IDOR scoping", () => {
-  it("scopes the ownership lookup to (listingId AND dealerId)", async () => {
+  // The dealerId filter rides on the UPDATE itself, so ownership is enforced
+  // by the statement that writes rather than by a separate read that a later
+  // refactor could drop.
+  it("scopes the write to (listingId AND dealerId)", async () => {
     await setListingStatus("listing_X", "SOLD");
-    expect(listingFindFirst).toHaveBeenCalledWith({
-      where: { id: "listing_X", dealerId: "dealer_A" },
-      select: { id: true },
-    });
-    // The write targets the id returned by that scoped lookup, never the
-    // caller-supplied id directly.
-    expect(listingUpdate).toHaveBeenCalledWith({
-      where: { id: "listing_X" },
-      data: { status: "SOLD" },
-    });
+    const [write] = listingWrites("update");
+    expect(write.payload).toEqual({ status: "SOLD" });
+    expect(write.filters).toEqual(
+      expect.arrayContaining([
+        { method: "eq", args: ["id", "listing_X"] },
+        { method: "eq", args: ["dealerId", "dealer_A"] },
+      ]),
+    );
   });
 
-  it("refuses another dealer's listing without writing", async () => {
-    listingFindFirst.mockResolvedValue(null);
+  it("refuses another dealer's listing — the write matches no row", async () => {
+    dbMock.on("Listing", { data: [] });
     await expect(setListingStatus("dealer_B_listing", "ACTIVE")).resolves.toEqual({
       ok: false,
       error: "Listing not found",
     });
-    expect(listingUpdate).not.toHaveBeenCalled();
+    // The statement runs, but its dealerId filter means it touches nothing.
+    expect(listingWrites("update")[0].filters).toContainEqual({
+      method: "eq",
+      args: ["dealerId", "dealer_A"],
+    });
   });
 
   it("redirects BUYER callers off the dashboard", async () => {
     authMock.mockResolvedValue({ user: { id: "u", role: "BUYER" } });
-    userFindUnique.mockResolvedValue({
-      id: "u",
-      email: "b@example.com",
-      name: "Buyer",
-      role: "BUYER",
-      dealer: null,
+    dbMock.on("User", {
+      data: { id: "u", email: "b@example.com", name: "Buyer", role: "BUYER", dealer: null },
     });
     await expect(setListingStatus("listing_X", "SOLD")).rejects.toThrow("REDIRECT:/");
-    expect(listingUpdate).not.toHaveBeenCalled();
+    expect(listingWrites("update")).toHaveLength(0);
   });
 
   // Role tampering: the session claims DEALER, the database says BUYER.
   // Authorization must follow the database.
   it("ignores a DEALER role claim in the session when the user row says BUYER", async () => {
     authMock.mockResolvedValue({ user: { id: "u", role: "DEALER" } });
-    userFindUnique.mockResolvedValue({
-      id: "u",
-      email: "b@example.com",
-      name: "Buyer",
-      role: "BUYER",
-      dealer: null,
+    dbMock.on("User", {
+      data: { id: "u", email: "b@example.com", name: "Buyer", role: "BUYER", dealer: null },
     });
     await expect(setListingStatus("listing_X", "SOLD")).rejects.toThrow("REDIRECT:/");
-    expect(listingUpdate).not.toHaveBeenCalled();
+    expect(listingWrites("update")).toHaveLength(0);
   });
 
   it("refuses writes from a SUSPENDED dealer", async () => {
-    userFindUnique.mockResolvedValue(dealerUserRow("SUSPENDED"));
-    dealerFindUnique.mockResolvedValue({
-      id: "dealer_A",
-      status: "SUSPENDED",
-      store: { slug: "a" },
-      subscription: {
-        status: "ACTIVE",
-        currentPeriodEnd: new Date(Date.now() + 86_400_000),
-      },
-    });
+    dbMock.on("User", { data: dealerUserRow("SUSPENDED") });
+    dbMock.on("Dealer", { data: dealerRow({ status: "SUSPENDED" }) });
     await expect(setListingStatus("listing_X", "ACTIVE")).rejects.toThrow(/suspended/i);
-    expect(listingUpdate).not.toHaveBeenCalled();
+    expect(listingWrites("update")).toHaveLength(0);
   });
 
   it("treats a deleted user as signed out even with a valid session cookie", async () => {
-    userFindUnique.mockResolvedValue(null);
+    dbMock.on("User", { data: null });
     await expect(setListingStatus("listing_X", "SOLD")).rejects.toThrow("REDIRECT:/login");
-    expect(listingUpdate).not.toHaveBeenCalled();
+    expect(listingWrites("update")).toHaveLength(0);
   });
 });
 
 describe("deleteListing — IDOR scoping", () => {
-  it("scopes the ownership lookup to (listingId AND dealerId)", async () => {
-    listingFindFirst.mockResolvedValue({ id: "listing_Y" });
+  it("scopes the delete to (listingId AND dealerId)", async () => {
+    dbMock.on("Listing", { data: [{ id: "listing_Y" }] });
     await deleteListing("listing_Y");
-    expect(listingFindFirst).toHaveBeenCalledWith({
-      where: { id: "listing_Y", dealerId: "dealer_A" },
-      select: { id: true },
-    });
-    expect(listingDelete).toHaveBeenCalledWith({ where: { id: "listing_Y" } });
+    expect(listingWrites("delete")[0].filters).toEqual(
+      expect.arrayContaining([
+        { method: "eq", args: ["id", "listing_Y"] },
+        { method: "eq", args: ["dealerId", "dealer_A"] },
+      ]),
+    );
   });
 
-  it("refuses another dealer's listing without deleting", async () => {
-    listingFindFirst.mockResolvedValue(null);
+  it("refuses another dealer's listing — the delete matches no row", async () => {
+    dbMock.on("Listing", { data: [] });
     await expect(deleteListing("dealer_B_listing")).resolves.toEqual({
       ok: false,
       error: "Listing not found",
     });
-    expect(listingDelete).not.toHaveBeenCalled();
   });
 
   // The billing gate is behind a feature flag that is off by default, so these
@@ -168,32 +157,30 @@ describe("deleteListing — IDOR scoping", () => {
   // never reaches the subscription checks.
   it("redirects callers to billing when subscription is PAST_DUE", async () => {
     process.env.NEXT_PUBLIC_BILLING_ENABLED = "true";
-    dealerFindUnique.mockResolvedValue({
-      id: "dealer_A",
-      status: "ACTIVE",
-      store: { slug: "a" },
-      subscription: { status: "PAST_DUE", currentPeriodEnd: new Date() },
+    dbMock.on("Dealer", {
+      data: dealerRow({
+        subscription: { status: "PAST_DUE", currentPeriodEnd: new Date().toISOString() },
+      }),
     });
     await expect(deleteListing("listing_Y")).rejects.toThrow(
       "REDIRECT:/dashboard/billing",
     );
-    expect(listingDelete).not.toHaveBeenCalled();
+    expect(listingWrites("delete")).toHaveLength(0);
   });
 
   it("redirects when subscription period has lapsed even with ACTIVE status", async () => {
     process.env.NEXT_PUBLIC_BILLING_ENABLED = "true";
-    dealerFindUnique.mockResolvedValue({
-      id: "dealer_A",
-      status: "ACTIVE",
-      store: { slug: "a" },
-      subscription: {
-        status: "ACTIVE",
-        currentPeriodEnd: new Date(Date.now() - 86_400_000),
-      },
+    dbMock.on("Dealer", {
+      data: dealerRow({
+        subscription: {
+          status: "ACTIVE",
+          currentPeriodEnd: new Date(Date.now() - 86_400_000).toISOString(),
+        },
+      }),
     });
     await expect(deleteListing("listing_Y")).rejects.toThrow(
       "REDIRECT:/dashboard/billing",
     );
-    expect(listingDelete).not.toHaveBeenCalled();
+    expect(listingWrites("delete")).toHaveLength(0);
   });
 });

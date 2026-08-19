@@ -6,6 +6,13 @@ against the OWASP Top 10 — without changing the frontend UI/UX.
 
 Companion document: [`API_AUTHORIZATION_MATRIX.md`](./API_AUTHORIZATION_MATRIX.md).
 
+> **Dated audit.** This report was written while the data layer was Prisma on
+> Neon. That layer is now `supabase-js` against Supabase — see
+> [`../migration/SUPABASE_MIGRATION.md`](../migration/SUPABASE_MIGRATION.md).
+> The authorization findings still hold (`lib/rbac` is unchanged and still the
+> primary gate), but the code snippets and the dependency notes below describe
+> the old stack. Two claims that changed substantively are annotated inline.
+
 ---
 
 ## 1. Architecture changes
@@ -276,7 +283,7 @@ The CSV template download carried no data, but an open handler under
 |---|---|---|
 | **A01** Broken Access Control | **7 findings, all fixed** — F-01, F-02, F-03, F-04, F-06, F-08, F-11. RBAC is now centralised, every ownership check re-reads the owner id from the database, and writes target the id returned by the scoped lookup rather than the client's. 100 authorization tests. |
 | **A02** Cryptographic Failures | **Pass.** bcrypt cost 12 for user passwords; API keys stored as SHA-256 with only an 8-char prefix retained, plaintext returned exactly once; Razorpay webhooks HMAC-verified; HSTS `max-age=63072000; includeSubDomains; preload`. The audit logger redacts any key matching `pass\|secret\|token\|otp\|key\|signature\|cookie\|authorization`. |
-| **A03** Injection | **Pass.** No `$queryRaw`/`$executeRaw` anywhere — all data access is Prisma's parameterized query builder. No `eval`/`new Function`. React escapes by default; the two `dangerouslySetInnerHTML` uses are JSON-LD passed through `jsonLdScriptContent()`, which escapes `</`. All request bodies validated with zod. F-09 closed the one output-encoding gap (attacker-chosen URL schemes in stored fields). |
+| **A03** Injection | **Pass.** No raw SQL anywhere — all data access goes through a query builder that parameterizes. No `eval`/`new Function`. React escapes by default; the two `dangerouslySetInnerHTML` uses are JSON-LD passed through `jsonLdScriptContent()`, which escapes `</`. All request bodies validated with zod. F-09 closed the one output-encoding gap (attacker-chosen URL schemes in stored fields). **Post-migration:** the builder is now PostgREST. Its `or=` parameter is a comma-separated list parsed by the server, so a user-supplied term interpolated into one *can* break out of its value and widen which columns are matched — not SQL injection, but a filter-injection of the same shape. Every `.or()` built from user input quotes and escapes the term (`lib/search.ts`, `app/api/public/listings`, `getBuyers`, the showcase search); a new one must do the same. |
 | **A04** Insecure Design | **Improved.** Trust boundary is now explicit and singular (`getAuthContext`). Privilege separation is enforced by permission, not by role string. Fail-safe: unknown roles → no permissions; scope misses → `null`/404 rather than an error that confirms existence. Rate limits on OTP send/verify, login (new), leads, RTO (new), AI description, public API. |
 | **A05** Security Misconfiguration | **Pass, with one caveat.** Strict CSP with a per-request nonce and `strict-dynamic`; `X-Frame-Options: DENY`, `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`. `lib/env.ts` hard-fails boot if any of `WHEEWISE_DEV_LOGIN`, `OTP_DEV_BYPASS`, `WHEEWISE_MOCK_GST`, `WHEEWISE_MOCK_RTO` is set in production. Dev fast-login requires `NODE_ENV=development` **and** the flag. Caveat: `style-src` still needs `'unsafe-inline'`. See R-02. |
 | **A06** Vulnerable Components | **Improved: 29 advisories → 4.** See §5. |
@@ -315,8 +322,11 @@ breaking-change risk was taken. Notable:
 **Remaining 4 (accepted):** `deepmerge-ts` (high, reached only via
 `@prisma/config`) and `esbuild` (low, dev-server-only file read on Windows).
 Both are build/dev-time, not present in the deployed runtime, and neither has a
-fix inside the current semver ranges. Re-check when Prisma ships an updated
-`@prisma/config`.
+fix inside the current semver ranges.
+
+> **Post-migration:** the `@prisma/config` path is gone with Prisma itself, so
+> the `deepmerge-ts` advisory should no longer appear. Re-run `npm audit` to
+> confirm and re-baseline this section.
 
 ---
 

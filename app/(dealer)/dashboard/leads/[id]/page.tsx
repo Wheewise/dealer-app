@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireDealer } from "@/lib/dealer";
-import { prisma } from "@/lib/db";
+import { db, unwrap, unwrapMaybe } from "@/lib/db";
 import { formatINR } from "@/lib/format";
 import { whatsappLink } from "@/lib/whatsapp";
 import { ReplyForm } from "./ReplyForm";
@@ -19,50 +19,74 @@ export default async function LeadDetailPage({ params }: { params: Params }) {
   const { id } = await params;
   const { dealer } = await requireDealer();
 
-  const enquiry = await prisma.enquiry.findFirst({
-    where: { id, dealerId: dealer.id },
-    include: {
-      listing: {
-        select: {
-          id: true,
-          make: true,
-          model: true,
-          year: true,
-          askingPrice: true,
-          photos: { take: 1, orderBy: { sortOrder: "asc" } },
-        },
-      },
+  // The dealerId filter is the ownership check.
+  const row = unwrapMaybe(
+    await db
+      .from("Enquiry")
+      .select(
+        `*, listing:Listing(
+           id, make, model, year, askingPrice,
+           photos:ListingPhoto(url, sortOrder)
+         )`,
+      )
+      .eq("id", id)
+      .eq("dealerId", dealer.id)
+      .maybeSingle(),
+    "lead detail",
+  );
+  if (!row) notFound();
+
+  // PostgREST cannot limit an embed per parent row.
+  const enquiry = {
+    ...row,
+    listing: {
+      ...row.listing,
+      photos: [...row.listing.photos].sort((a, b) => a.sortOrder - b.sortOrder).slice(0, 1),
     },
-  });
-  if (!enquiry) notFound();
+  };
 
   if (!enquiry.isRead) {
-    await prisma.enquiry.update({ where: { id: enquiry.id }, data: { isRead: true } });
+    unwrap(
+      await db.from("Enquiry").update({ isRead: true }).eq("id", enquiry.id).select("id"),
+      "lead detail: mark read",
+    );
   }
 
   const conversation = enquiry.buyerId
-    ? await prisma.conversation.findUnique({
-        where: { listingId_buyerId: { listingId: enquiry.listingId, buyerId: enquiry.buyerId } },
-      })
+    ? unwrapMaybe(
+        await db
+          .from("Conversation")
+          .select("id")
+          .eq("listingId", enquiry.listingId)
+          .eq("buyerId", enquiry.buyerId)
+          .maybeSingle(),
+        "lead detail: conversation",
+      )
     : null;
 
   const messages = conversation
-    ? await prisma.message.findMany({
-        where: { conversationId: conversation.id },
-        orderBy: { createdAt: "asc" },
-      })
+    ? unwrap(
+        await db
+          .from("Message")
+          .select("*")
+          .eq("conversationId", conversation.id)
+          .order("createdAt", { ascending: true }),
+        "lead detail: messages",
+      )
     : [];
 
   const unreadIds = messages
     .filter((m) => m.senderId !== dealer.userId && !m.readAt)
     .map((m) => m.id);
   if (unreadIds.length > 0) {
-    // updateMany runs as a multi-statement transaction, which the Cloudflare
-    // Workers Neon HTTP adapter can't do (see lib/db.ts) — update each row
-    // individually instead.
-    const readAt = new Date();
-    await Promise.all(
-      unreadIds.map((id) => prisma.message.update({ where: { id }, data: { readAt } })),
+    // One statement for the whole batch.
+    unwrap(
+      await db
+        .from("Message")
+        .update({ readAt: new Date().toISOString() })
+        .in("id", unreadIds)
+        .select("id"),
+      "lead detail: mark messages read",
     );
   }
 

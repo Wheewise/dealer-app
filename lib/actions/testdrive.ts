@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { auth } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { db, unwrap, unwrapMaybe } from "@/lib/db";
 import { requireDealer } from "@/lib/dealer";
 import { dispatchNotification } from "@/lib/notifications";
 import { appUrl } from "@/lib/json-ld";
@@ -10,6 +10,14 @@ import { appUrl } from "@/lib/json-ld";
 export type TestDriveActionResult = { ok: true } | { ok: false; error: string };
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+const LISTING_CARD =
+  "listing:Listing(id, make, model, year, photos:ListingPhoto(id, url, sortOrder))";
+
+/** First photo by sortOrder — PostgREST cannot order an embed per parent row. */
+function firstPhoto<T extends { sortOrder: number }>(photos: T[]): T[] {
+  return [...photos].sort((a, b) => a.sortOrder - b.sortOrder).slice(0, 1);
+}
 
 export async function requestTestDrive(
   listingId: string,
@@ -32,29 +40,39 @@ export async function requestTestDrive(
     return { ok: false, error: "Test drives can only be booked within the next 30 days." };
   }
 
-  const listing = await prisma.listing.findUnique({
-    where: { id: listingId },
-    include: { dealer: true },
-  });
+  const listing = unwrapMaybe(
+    await db
+      .from("Listing")
+      .select("*, dealer:Dealer(*)")
+      .eq("id", listingId)
+      .maybeSingle(),
+    "requestTestDrive: listing",
+  );
   if (!listing || listing.status !== "ACTIVE") {
     return { ok: false, error: "This listing is not available." };
   }
   if (!listing.testDriveAvailable) {
     return { ok: false, error: "This dealer isn't offering test drives for this vehicle." };
   }
-  if (listing.dealer.userId === session.user.id) {
+  const dealer = listing.dealer;
+  if (dealer.userId === session.user.id) {
     return { ok: false, error: "You can't book a test drive on your own listing." };
   }
 
-  await prisma.testDrive.create({
-    data: {
-      listingId,
-      dealerId: listing.dealerId,
-      buyerId: session.user.id,
-      scheduledAt,
-      notes: notes?.trim() || null,
-    },
-  });
+  unwrap(
+    await db
+      .from("TestDrive")
+      .insert({
+        listingId,
+        dealerId: listing.dealerId,
+        buyerId: session.user.id,
+        scheduledAt: scheduledAt.toISOString(),
+        notes: notes?.trim() || null,
+      })
+      .select("id")
+      .single(),
+    "requestTestDrive",
+  );
 
   const vehicle = `${listing.year} ${listing.make} ${listing.model}`;
   const when = scheduledAt.toLocaleString("en-IN", {
@@ -62,7 +80,7 @@ export async function requestTestDrive(
     timeStyle: "short",
   });
   await dispatchNotification({
-    toPhone: listing.dealer.phone,
+    toPhone: dealer.phone,
     subject: `Test drive requested — ${vehicle}`,
     body: `${session.user.name ?? "A buyer"} requested a test drive for your ${vehicle} on ${when}. View: ${appUrl("/dashboard/test-drives")}`,
     type: "TEST_DRIVE_REQUESTED",
@@ -81,13 +99,16 @@ export async function updateTestDriveStatus(
 ): Promise<TestDriveActionResult> {
   const { dealer } = await requireDealer({ write: true });
 
-  const testDrive = await prisma.testDrive.findFirst({
-    where: { id: testDriveId, dealerId: dealer.id },
-    select: { id: true },
-  });
-  if (!testDrive) return { ok: false, error: "Test drive request not found." };
-
-  await prisma.testDrive.update({ where: { id: testDrive.id }, data: { status } });
+  const updated = unwrap(
+    await db
+      .from("TestDrive")
+      .update({ status })
+      .eq("id", testDriveId)
+      .eq("dealerId", dealer.id)
+      .select("id"),
+    "updateTestDriveStatus",
+  );
+  if (updated.length === 0) return { ok: false, error: "Test drive request not found." };
 
   revalidatePath("/dashboard/test-drives");
   revalidatePath("/my-test-drives");
@@ -96,41 +117,36 @@ export async function updateTestDriveStatus(
 
 export async function getTestDrivesForDealer() {
   const { dealer } = await requireDealer();
-  return prisma.testDrive.findMany({
-    where: { dealerId: dealer.id },
-    include: {
-      listing: {
-        select: {
-          id: true,
-          make: true,
-          model: true,
-          year: true,
-          photos: { take: 1, orderBy: { sortOrder: "asc" } },
-        },
-      },
-      buyer: { select: { name: true, phone: true, email: true } },
-    },
-    orderBy: { scheduledAt: "asc" },
-  });
+  const rows = unwrap(
+    await db
+      .from("TestDrive")
+      .select(`*, ${LISTING_CARD}, buyer:User(name, phone, email)`)
+      .eq("dealerId", dealer.id)
+      .order("scheduledAt", { ascending: true }),
+    "getTestDrivesForDealer",
+  );
+
+  return rows.map((t) => ({
+    ...t,
+    listing: { ...t.listing, photos: firstPhoto(t.listing.photos) },
+  }));
 }
 
 export async function getTestDrivesForBuyer() {
   const session = await auth();
   if (!session?.user?.id) return [];
-  return prisma.testDrive.findMany({
-    where: { buyerId: session.user.id },
-    include: {
-      listing: {
-        select: {
-          id: true,
-          make: true,
-          model: true,
-          year: true,
-          photos: { take: 1, orderBy: { sortOrder: "asc" } },
-        },
-      },
-      dealer: { select: { businessName: true } },
-    },
-    orderBy: { scheduledAt: "asc" },
-  });
+
+  const rows = unwrap(
+    await db
+      .from("TestDrive")
+      .select(`*, ${LISTING_CARD}, dealer:Dealer(businessName)`)
+      .eq("buyerId", session.user.id)
+      .order("scheduledAt", { ascending: true }),
+    "getTestDrivesForBuyer",
+  );
+
+  return rows.map((t) => ({
+    ...t,
+    listing: { ...t.listing, photos: firstPhoto(t.listing.photos) },
+  }));
 }

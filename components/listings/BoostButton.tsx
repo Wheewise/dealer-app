@@ -24,7 +24,8 @@ export function BoostButton({
 }: {
   listingId: string;
   isBoosted: boolean;
-  boostExpiresAt: Date | null;
+  // ISO-8601 from the database; the JSX parses it where it is displayed.
+  boostExpiresAt: string | null;
 }) {
   const [boosting, setBoosting] = useState(false);
   const [boosted, setBoosted] = useState(isBoosted);
@@ -84,7 +85,7 @@ export function BoostButton({
           expiresAt: string;
         };
         setBoosted(true);
-        setExpiresAt(new Date(newExpiry));
+        setExpiresAt(newExpiry);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Boost failed");
       } finally {

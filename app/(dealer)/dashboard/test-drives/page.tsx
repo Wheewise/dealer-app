@@ -72,7 +72,7 @@ export default async function DealerTestDrivesPage({
           {filtered.map((t) => {
             const vehicle = `${t.listing.year} ${t.listing.make} ${t.listing.model}`;
             const photo = t.listing.photos[0]?.url;
-            const when = t.scheduledAt.toLocaleString("en-IN", {
+            const when = new Date(t.scheduledAt).toLocaleString("en-IN", {
               dateStyle: "medium",
               timeStyle: "short",
             });
@@ -113,7 +113,7 @@ export default async function DealerTestDrivesPage({
                 <div className="shrink-0">
                   {t.status === "COMPLETED" ? (
                     <span className="text-xs text-zinc-500">
-                      Completed {t.updatedAt.toLocaleDateString("en-IN")}
+                      Completed {new Date(t.updatedAt).toLocaleDateString("en-IN")}
                     </span>
                   ) : (
                     <TestDriveActions testDriveId={t.id} status={t.status} />

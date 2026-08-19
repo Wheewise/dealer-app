@@ -39,7 +39,7 @@ export const PERMISSIONS = [
 
 export type Permission = (typeof PERMISSIONS)[number];
 
-/** Roles as persisted on `User.role` (mirrors the Prisma `Role` enum). */
+/** Roles as persisted on `User.role` (mirrors the `Role` enum in the schema). */
 export type AppRole = "BUYER" | "DEALER" | "ADMIN" | "SUPER_ADMIN";
 
 /** The three role-scoped applications this codebase is split into. */
@@ -71,7 +71,8 @@ const ADMIN_PERMISSIONS: readonly Permission[] = [
 
 /**
  * Deny-by-default: a role absent from this map resolves to the empty set, so a
- * newly added Prisma role grants nothing until it is listed here explicitly.
+ * value newly added to the `Role` enum grants nothing until it is listed here
+ * explicitly.
  */
 export const ROLE_PERMISSIONS: Readonly<Record<AppRole, ReadonlySet<Permission>>> = {
   BUYER: new Set(USER_PERMISSIONS),

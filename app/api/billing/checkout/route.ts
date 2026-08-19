@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { apiRequireDealer } from "@/lib/rbac";
-import { prisma } from "@/lib/db";
+import { db, unwrap } from "@/lib/db";
 import { razorpay, PLAN_IDS, type RazorpayPlanTier } from "@/lib/razorpay";
 
 const bodySchema = z.object({ plan: z.enum(["MONTHLY", "YEARLY"]) });
@@ -35,17 +35,35 @@ export async function POST(req: Request) {
     notes: { dealerId: dealer.id, plan },
   });
 
-  await prisma.subscription.upsert({
-    where: { dealerId: dealer.id },
-    create: {
-      dealerId: dealer.id,
-      plan,
-      status: "TRIALING",
-      razorpaySubId: sub.id,
-      currentPeriodEnd: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
-    },
-    update: { plan, razorpaySubId: sub.id },
-  });
+  // Deliberately not one upsert: an existing subscription must keep its
+  // `status` and `currentPeriodEnd`. Overwriting those would drop a paying
+  // dealer back to TRIALING with a fresh 14-day window every time they
+  // switched plans. Only a first-time row gets the trial defaults.
+  const updated = unwrap(
+    await db
+      .from("Subscription")
+      .update({ plan, razorpaySubId: sub.id })
+      .eq("dealerId", dealer.id!)
+      .select("id"),
+    "billing/checkout: update subscription",
+  );
+
+  if (updated.length === 0) {
+    unwrap(
+      await db
+        .from("Subscription")
+        .insert({
+          dealerId: dealer.id!,
+          plan,
+          status: "TRIALING",
+          razorpaySubId: sub.id,
+          currentPeriodEnd: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
+        })
+        .select("id")
+        .single(),
+      "billing/checkout: create subscription",
+    );
+  }
 
   return NextResponse.json({
     subscriptionId: sub.id,

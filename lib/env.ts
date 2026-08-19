@@ -1,7 +1,10 @@
 import { z } from "zod";
 
 const serverSchema = z.object({
-  DATABASE_URL: z.string().url(),
+  // Accepted as an alias for NEXT_PUBLIC_SUPABASE_URL so server-only
+  // deployments need not expose the project URL to the browser bundle.
+  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
   AUTH_SECRET: z.string().min(32),
   AUTH_URL: z.string().url().optional(),
   BLOB_READ_WRITE_TOKEN: z.string().optional(),
@@ -19,6 +22,8 @@ const serverSchema = z.object({
 
 const publicSchema = z.object({
   NEXT_PUBLIC_APP_URL: z.string().url(),
+  NEXT_PUBLIC_SUPABASE_URL: z.string().url(),
+  NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(20),
 });
 
 let parsed = false;

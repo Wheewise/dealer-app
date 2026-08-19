@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
 import { apiRequireDealer } from "@/lib/rbac";
-import { prisma } from "@/lib/db";
+import { db, isUniqueViolation, unwrap, unwrapMaybe } from "@/lib/db";
 import {
   razorpay,
   verifyPaymentSignature,
@@ -61,33 +60,35 @@ export async function POST(req: Request) {
   }
   const days = plan.days;
 
-  const listing = await prisma.listing.findFirst({
-    where: { id: notes.listingId, dealerId: dealer.id },
-    select: { id: true, boostExpiresAt: true },
-  });
+  const listing = unwrapMaybe(
+    await db
+      .from("Listing")
+      .select("id, boostExpiresAt")
+      .eq("id", notes.listingId)
+      .eq("dealerId", dealer.id!)
+      .maybeSingle(),
+    "boost verify: listing",
+  );
   if (!listing) {
     return NextResponse.json({ error: "Listing not found" }, { status: 404 });
   }
 
-  // Idempotency: write the Payment row first with razorpay_payment_id unique.
-  // A second verify of the same payment hits P2002 and we return the existing
-  // result without re-extending the boost.
-  try {
-    await prisma.payment.create({
-      data: {
-        razorpayOrderId: razorpay_order_id,
-        razorpayPaymentId: razorpay_payment_id,
-        razorpaySignature: razorpay_signature,
-        kind: "BOOST",
-        amount: plan.amount,
-        status: "SUCCEEDED",
-        dealerId: dealer.id,
-        listingId: listing.id,
-        notes: { duration: notes.duration, days },
-      },
-    });
-  } catch (err) {
-    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+  // Idempotency: write the Payment row first, with razorpayPaymentId unique.
+  // A second verify of the same payment violates that index (23505) and we
+  // return the existing result without re-extending the boost.
+  const { error: paymentError } = await db.from("Payment").insert({
+    razorpayOrderId: razorpay_order_id,
+    razorpayPaymentId: razorpay_payment_id,
+    razorpaySignature: razorpay_signature,
+    kind: "BOOST",
+    amount: plan.amount,
+    status: "SUCCEEDED",
+    dealerId: dealer.id,
+    listingId: listing.id,
+    notes: { duration: notes.duration, days },
+  });
+  if (paymentError) {
+    if (isUniqueViolation(paymentError)) {
       return NextResponse.json(
         {
           ok: true,
@@ -97,19 +98,23 @@ export async function POST(req: Request) {
         { status: 200 },
       );
     }
-    throw err;
+    throw new Error(paymentError.message);
   }
 
-  const base =
-    listing.boostExpiresAt && listing.boostExpiresAt > new Date()
-      ? listing.boostExpiresAt
-      : new Date();
+  // Extend an unexpired boost rather than restarting it, so a dealer who
+  // tops up early does not lose the remaining days.
+  const existingExpiry = listing.boostExpiresAt ? new Date(listing.boostExpiresAt) : null;
+  const base = existingExpiry && existingExpiry > new Date() ? existingExpiry : new Date();
   const boostExpiresAt = new Date(base.getTime() + days * 24 * 60 * 60 * 1000);
 
-  await prisma.listing.update({
-    where: { id: listing.id },
-    data: { isBoosted: true, boostExpiresAt },
-  });
+  unwrap(
+    await db
+      .from("Listing")
+      .update({ isBoosted: true, boostExpiresAt: boostExpiresAt.toISOString() })
+      .eq("id", listing.id)
+      .select("id"),
+    "boost verify: extend",
+  );
 
   return NextResponse.json({ ok: true, expiresAt: boostExpiresAt });
 }

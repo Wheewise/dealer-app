@@ -5,6 +5,7 @@ import { useActionState } from "react";
 import { signupBuyer, type SignupState } from "@/lib/actions/auth";
 import { Field, Input, Select, Button } from "@/components/ui/Field";
 import statesData from "@/lib/data/india-states-districts.json";
+import { Turnstile } from "@/components/common/Turnstile";
 
 interface StateEntry {
   state: string;
@@ -105,6 +106,12 @@ export function BuyerSignupForm() {
           ))}
         </Select>
       </Field>
+      {errors.form ? (
+        <p className="bg-brand-red/10 text-brand-red rounded-md px-3 py-2 text-sm">
+          {errors.form[0]}
+        </p>
+      ) : null}
+      <Turnstile action="signup-buyer" />
       <Button type="submit" disabled={pending} className="w-full">
         {pending ? "Creating account…" : "Create account"}
       </Button>

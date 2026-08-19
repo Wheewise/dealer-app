@@ -2,10 +2,10 @@
 
 import { revalidatePath } from "next/cache";
 import { auth } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { db, unwrap, unwrapMaybe } from "@/lib/db";
 import { requireDealer } from "@/lib/dealer";
 import { getAuthContext, logAuthzDenied, type AuthContext } from "@/lib/rbac";
-import type { RCTransferStatus } from "@prisma/client";
+import type { RCTransferStatus } from "@/types/supabase";
 
 /** Seller, buyer, or admin. The only parties allowed to see a transfer. */
 function isTransferParticipant(
@@ -53,25 +53,30 @@ export async function initiateTransfer(data: {
 }): Promise<InitiateTransferResult> {
   const { dealer } = await requireDealer({ write: true });
 
-  const listing = await prisma.listing.findFirst({
-    where: { id: data.listingId, dealerId: dealer.id },
-    include: { dealer: true },
-  });
+  const listing = unwrapMaybe(
+    await db
+      .from("Listing")
+      .select("*, dealer:Dealer(userId)")
+      .eq("id", data.listingId)
+      .eq("dealerId", dealer.id)
+      .maybeSingle(),
+    "initiateTransfer: listing",
+  );
   if (!listing) return { ok: false, error: "Listing not found." };
   if (listing.status !== "SOLD") {
     return { ok: false, error: "Mark this listing as sold before starting a transfer." };
   }
 
-  const existing = await prisma.rCTransfer.findUnique({
-    where: { listingId: listing.id },
-    select: { id: true },
-  });
+  const existing = unwrapMaybe(
+    await db.from("RCTransfer").select("id").eq("listingId", listing.id).maybeSingle(),
+    "initiateTransfer: existing",
+  );
   if (existing) return { ok: false, error: "A transfer already exists for this listing." };
 
-  const buyer = await prisma.user.findUnique({
-    where: { id: data.buyerId },
-    select: { id: true },
-  });
+  const buyer = unwrapMaybe(
+    await db.from("User").select("id").eq("id", data.buyerId).maybeSingle(),
+    "initiateTransfer: buyer",
+  );
   if (!buyer) return { ok: false, error: "Buyer not found." };
 
   const registrationNo = data.registrationNo.trim();
@@ -80,18 +85,23 @@ export async function initiateTransfer(data: {
     return { ok: false, error: "Enter a valid sale amount." };
   }
 
-  const transfer = await prisma.rCTransfer.create({
-    data: {
-      listingId: listing.id,
-      sellerId: listing.dealer.userId,
-      buyerId: buyer.id,
-      registrationNo,
-      vehicleName: `${listing.year} ${listing.make} ${listing.model}`,
-      saleAmount: data.saleAmount,
-      status: "INITIATED",
-      currentStep: 1,
-    },
-  });
+  const transfer = unwrap(
+    await db
+      .from("RCTransfer")
+      .insert({
+        listingId: listing.id,
+        sellerId: listing.dealer.userId,
+        buyerId: buyer.id,
+        registrationNo,
+        vehicleName: `${listing.year} ${listing.make} ${listing.model}`,
+        saleAmount: data.saleAmount,
+        status: "INITIATED",
+        currentStep: 1,
+      })
+      .select("id")
+      .single(),
+    "initiateTransfer",
+  );
 
   revalidatePath("/dashboard/transfers");
   revalidatePath(`/vehicle/${listing.id}`);
@@ -113,7 +123,10 @@ export async function updateTransferStep(
   const session = await auth();
   if (!session?.user?.id) return { ok: false, error: "Login required." };
 
-  const transfer = await prisma.rCTransfer.findUnique({ where: { id: transferId } });
+  const transfer = unwrapMaybe(
+    await db.from("RCTransfer").select("*").eq("id", transferId).maybeSingle(),
+    "updateTransferStep lookup",
+  );
   if (!transfer) return { ok: false, error: "Transfer not found." };
 
   const isSeller = transfer.sellerId === session.user.id;
@@ -132,15 +145,30 @@ export async function updateTransferStep(
 
   const status = statusForUpdate(data, transfer.status);
 
-  await prisma.rCTransfer.update({
-    where: { id: transferId },
-    data: { ...data, currentStep: step, status },
-  });
+  unwrap(
+    await db
+      .from("RCTransfer")
+      .update({ ...data, currentStep: step, status })
+      .eq("id", transferId)
+      .select("id"),
+    "updateTransferStep",
+  );
 
   revalidatePath(`/rc-transfer/${transferId}`);
   revalidatePath("/dashboard/transfers");
   return { ok: true };
 }
+
+/**
+ * RCTransfer has two foreign keys into User, so an unqualified `User(...)`
+ * embed is ambiguous and PostgREST rejects it. Naming the constraint picks
+ * the side.
+ */
+const TRANSFER_PARTIES = `
+  documents:RCDocument(*),
+  seller:User!RCTransfer_sellerId_fkey(id, name, phone),
+  buyer:User!RCTransfer_buyerId_fkey(id, name, phone)
+`;
 
 /**
  * A transfer row carries both parties' names and phone numbers, so it is
@@ -159,15 +187,14 @@ export async function getTransferById(id: string) {
   const ctx = await getAuthContext();
   if (!ctx) return null;
 
-  const transfer = await prisma.rCTransfer.findUnique({
-    where: { id },
-    include: {
-      documents: true,
-      seller: { select: { id: true, name: true, phone: true } },
-      buyer: { select: { id: true, name: true, phone: true } },
-      listing: { select: { id: true, make: true, model: true, year: true } },
-    },
-  });
+  const transfer = unwrapMaybe(
+    await db
+      .from("RCTransfer")
+      .select(`*, ${TRANSFER_PARTIES}, listing:Listing(id, make, model, year)`)
+      .eq("id", id)
+      .maybeSingle(),
+    "getTransferById",
+  );
 
   if (!transfer) return null;
   if (!isTransferParticipant(ctx, transfer)) {
@@ -188,14 +215,14 @@ export async function getTransferByListing(listingId: string) {
   const ctx = await getAuthContext();
   if (!ctx) return null;
 
-  const transfer = await prisma.rCTransfer.findUnique({
-    where: { listingId },
-    include: {
-      documents: true,
-      seller: { select: { id: true, name: true, phone: true } },
-      buyer: { select: { id: true, name: true, phone: true } },
-    },
-  });
+  const transfer = unwrapMaybe(
+    await db
+      .from("RCTransfer")
+      .select(`*, ${TRANSFER_PARTIES}`)
+      .eq("listingId", listingId)
+      .maybeSingle(),
+    "getTransferByListing",
+  );
 
   if (!transfer) return null;
   if (!isTransferParticipant(ctx, transfer)) {
@@ -213,14 +240,20 @@ export async function getTransferByListing(listingId: string) {
 
 export async function getTransfersForDealer() {
   const { dealer } = await requireDealer();
-  return prisma.rCTransfer.findMany({
-    where: { sellerId: dealer.userId },
-    include: {
-      buyer: { select: { name: true, phone: true } },
-      listing: { select: { id: true, make: true, model: true, year: true } },
-    },
-    orderBy: { updatedAt: "desc" },
-  });
+  const rows = unwrap(
+    await db
+      .from("RCTransfer")
+      .select(
+        `*,
+         buyer:User!RCTransfer_buyerId_fkey(name, phone),
+         listing:Listing(id, make, model, year)`,
+      )
+      .eq("sellerId", dealer.userId)
+      .order("updatedAt", { ascending: false }),
+    "getTransfersForDealer",
+  );
+
+  return rows;
 }
 
 // Sold listings for this dealer that don't have a transfer yet, plus the
@@ -229,52 +262,64 @@ export async function getTransfersForDealer() {
 export async function getSoldListingsAwaitingTransfer() {
   const { dealer } = await requireDealer();
 
-  const listings = await prisma.listing.findMany({
-    where: { dealerId: dealer.id, status: "SOLD", rcTransfer: null },
-    select: {
-      id: true,
-      make: true,
-      model: true,
-      year: true,
-      askingPrice: true,
-      enquiries: {
-        where: { buyerId: { not: null } },
-        select: { buyerId: true, buyerName: true, buyer: { select: { name: true, phone: true } } },
-        distinct: ["buyerId"],
-      },
-      testDrives: {
-        select: { buyerId: true, buyer: { select: { name: true, phone: true } } },
-        distinct: ["buyerId"],
-      },
-    },
-    orderBy: { updatedAt: "desc" },
-  });
+  // PostgREST has no "where the related row is absent" filter, so the
+  // already-transferred ids are subtracted here instead. Both sets are
+  // scoped to this dealer's SOLD inventory, so neither is large.
+  const [listings, transferred] = await Promise.all([
+    unwrap(
+      await db
+        .from("Listing")
+        .select(
+          `id, make, model, year, askingPrice,
+           enquiries:Enquiry(buyerId, buyerName, buyer:User(name, phone)),
+           testDrives:TestDrive(buyerId, buyer:User(name, phone))`,
+        )
+        .eq("dealerId", dealer.id)
+        .eq("status", "SOLD")
+        .order("updatedAt", { ascending: false }),
+      "getSoldListingsAwaitingTransfer: listings",
+    ),
+    unwrap(
+      await db
+        .from("RCTransfer")
+        .select("listingId, listing:Listing!inner(dealerId)")
+        .eq("listing.dealerId", dealer.id),
+      "getSoldListingsAwaitingTransfer: transfers",
+    ),
+  ]);
 
-  return listings.map((l) => {
-    const candidates = new Map<string, { id: string; name: string; phone: string | null }>();
-    for (const e of l.enquiries) {
-      if (e.buyerId) {
+  const alreadyTransferred = new Set(transferred.map((t) => t.listingId));
+
+  return listings
+    .filter((l) => !alreadyTransferred.has(l.id))
+    .map((l) => {
+      // A buyer who both enquired and booked a test drive appears once —
+      // the Map keyed by buyer id is what Prisma's `distinct` used to do.
+      const candidates = new Map<string, { id: string; name: string; phone: string | null }>();
+      for (const e of l.enquiries) {
+        // Enquiry.buyerId is nullable — anonymous leads have no account and
+        // cannot be the counterparty on a transfer.
+        if (!e.buyerId) continue;
         candidates.set(e.buyerId, {
           id: e.buyerId,
           name: e.buyer?.name ?? e.buyerName,
           phone: e.buyer?.phone ?? null,
         });
       }
-    }
-    for (const t of l.testDrives) {
-      candidates.set(t.buyerId, {
-        id: t.buyerId,
-        name: t.buyer.name ?? "Buyer",
-        phone: t.buyer.phone,
-      });
-    }
-    return {
-      id: l.id,
-      make: l.make,
-      model: l.model,
-      year: l.year,
-      askingPrice: Number(l.askingPrice),
-      candidates: [...candidates.values()],
-    };
-  });
+      for (const t of l.testDrives) {
+        candidates.set(t.buyerId, {
+          id: t.buyerId,
+          name: t.buyer.name ?? "Buyer",
+          phone: t.buyer.phone,
+        });
+      }
+      return {
+        id: l.id,
+        make: l.make,
+        model: l.model,
+        year: l.year,
+        askingPrice: Number(l.askingPrice),
+        candidates: [...candidates.values()],
+      };
+    });
 }

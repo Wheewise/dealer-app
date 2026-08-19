@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/Field";
 import { applyForLoan } from "@/lib/actions/finance";
-import type { NBFC } from "@prisma/client";
+import type { NBFC } from "@/types/supabase";
 
 const NBFC_OPTIONS: { value: NBFC; label: string }[] = [
   { value: "BAJAJ_FINSERV", label: "Bajaj Finserv" },

@@ -1,31 +1,32 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../../lib/auth", () => ({ auth: vi.fn() }));
-vi.mock("../../lib/db", () => ({
-  prisma: {
-    user: { findUnique: vi.fn() },
-    post: { findMany: vi.fn(), findUnique: vi.fn() },
-  },
-}));
+vi.mock("../../lib/db", async () => {
+  const { makeDbModule } = await import("../helpers/supabase-mock");
+  return makeDbModule();
+});
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 vi.mock("../../lib/moderation", () => ({ moderateContent: vi.fn(() => ({ ok: true })) }));
 
 import { auth } from "../../lib/auth";
-import { prisma } from "../../lib/db";
+import * as dbModule from "../../lib/db";
+import type { DbMock } from "../helpers/supabase-mock";
 import { getPosts, getPost } from "../../lib/actions/community";
 
 type M = ReturnType<typeof vi.fn>;
 const authMock = auth as unknown as M;
-const userFindUnique = prisma.user.findUnique as unknown as M;
-const postFindMany = prisma.post.findMany as unknown as M;
-const postFindUnique = prisma.post.findUnique as unknown as M;
+const dbMock = (dbModule as unknown as { __mock: DbMock }).__mock;
+
+function postReads() {
+  return dbMock.calls.filter((c) => c.table === "Post" && c.operation === "select");
+}
 
 function signIn(
   row: { id: string; role: string; dealer?: { id: string; status: "ACTIVE" } } | null,
 ) {
   authMock.mockResolvedValue(row ? { user: { id: row.id, role: row.role } } : null);
-  userFindUnique.mockResolvedValue(
-    row
+  dbMock.on("User", {
+    data: row
       ? {
           id: row.id,
           email: `${row.id}@example.com`,
@@ -34,7 +35,7 @@ function signIn(
           dealer: row.dealer ?? null,
         }
       : null,
-  );
+  });
 }
 
 const DEALER = {
@@ -43,9 +44,13 @@ const DEALER = {
   dealer: { id: "dealer_A", status: "ACTIVE" as const },
 };
 
+/** A list row carries the embedded count aggregates the action reshapes. */
+const LIST_ROW = { id: "p1", replies: [{ count: 0 }], upvotes: [{ count: 0 }] };
+
 beforeEach(() => {
   vi.clearAllMocks();
-  postFindMany.mockResolvedValue([{ id: "p1" }]);
+  dbMock.reset();
+  dbMock.on("Post", { data: [LIST_ROW] });
 });
 
 /**
@@ -56,39 +61,43 @@ describe("dealer forum is not readable by outsiders", () => {
   it("returns nothing to an anonymous caller", async () => {
     signIn(null);
     await expect(getPosts("DEALER")).resolves.toEqual([]);
-    expect(postFindMany).not.toHaveBeenCalled();
+    expect(postReads()).toHaveLength(0);
   });
 
   it("returns nothing to a buyer", async () => {
     signIn({ id: "u_b", role: "BUYER" });
     await expect(getPosts("DEALER")).resolves.toEqual([]);
-    expect(postFindMany).not.toHaveBeenCalled();
+    expect(postReads()).toHaveLength(0);
   });
 
   it("returns posts to a dealer", async () => {
     signIn(DEALER);
-    await expect(getPosts("DEALER")).resolves.toEqual([{ id: "p1" }]);
+    await expect(getPosts("DEALER")).resolves.toMatchObject([{ id: "p1" }]);
   });
 
   it("returns posts to an admin", async () => {
     signIn({ id: "u_admin", role: "ADMIN" });
-    await expect(getPosts("DEALER")).resolves.toEqual([{ id: "p1" }]);
+    await expect(getPosts("DEALER")).resolves.toMatchObject([{ id: "p1" }]);
   });
 
   it("leaves the buyer community public", async () => {
     signIn(null);
-    await expect(getPosts("BUYER")).resolves.toEqual([{ id: "p1" }]);
+    await expect(getPosts("BUYER")).resolves.toMatchObject([{ id: "p1" }]);
   });
 
   it("hides an individual dealer-forum thread from a buyer", async () => {
     signIn({ id: "u_b", role: "BUYER" });
-    postFindUnique.mockResolvedValue({ id: "p1", community: "DEALER" });
+    dbMock.on("Post", {
+      data: { id: "p1", community: "DEALER", replies: [], upvotes: [{ count: 0 }] },
+    });
     await expect(getPost("p1")).resolves.toBeNull();
   });
 
   it("shows an individual buyer-community thread to anyone", async () => {
     signIn(null);
-    postFindUnique.mockResolvedValue({ id: "p1", community: "BUYER" });
+    dbMock.on("Post", {
+      data: { id: "p1", community: "BUYER", replies: [], upvotes: [{ count: 0 }] },
+    });
     await expect(getPost("p1")).resolves.toMatchObject({ id: "p1" });
   });
 });
@@ -97,17 +106,20 @@ describe("public forum reads do not carry author emails", () => {
   it("selects only the author's name", async () => {
     signIn(null);
     await getPosts("BUYER");
-    const include = postFindMany.mock.calls[0][0].include;
-    expect(include.author).toEqual({ select: { name: true } });
-    expect(include.author.select.email).toBeUndefined();
+    const projection = postReads()[0].select ?? "";
+    expect(projection).toContain("author:User(name)");
+    expect(projection).not.toContain("email");
   });
 
   it("applies the same projection to replies", async () => {
     signIn(null);
-    postFindUnique.mockResolvedValue({ id: "p1", community: "BUYER" });
+    dbMock.on("Post", {
+      data: { id: "p1", community: "BUYER", replies: [], upvotes: [{ count: 0 }] },
+    });
     await getPost("p1");
-    const include = postFindUnique.mock.calls[0][0].include;
-    expect(include.author).toEqual({ select: { name: true } });
-    expect(include.replies.include.author).toEqual({ select: { name: true } });
+    const projection = postReads()[0].select ?? "";
+    expect(projection).toContain("author:User(name)");
+    expect(projection).toContain("replies:Reply(*, author:User(name))");
+    expect(projection).not.toContain("email");
   });
 });

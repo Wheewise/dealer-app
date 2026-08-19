@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { db, unwrapMaybe } from "@/lib/db";
 import { isBillingEnabled } from "@/lib/billing";
 import { AuthorizationError, getAuthContext, logAuthzDenied } from "@/lib/rbac";
 import { userAppHome } from "@/lib/app-urls";
@@ -33,11 +33,25 @@ export async function requireDealer({
     redirect(userAppHome());
   }
 
-  const dealer = await prisma.dealer.findUnique({
-    where: { id: ctx.dealerId },
-    include: { store: true, subscription: true },
-  });
-  if (!dealer) redirect("/login");
+  // store and subscription are to-one embeds (both FKs are unique), so
+  // PostgREST returns an object or null for each.
+  const row = unwrapMaybe(
+    await db
+      .from("Dealer")
+      .select("*, store:Store(*), subscription:Subscription(*)")
+      .eq("id", ctx.dealerId)
+      .maybeSingle(),
+    "requireDealer",
+  );
+  if (!row) redirect("/login");
+
+  const dealer = {
+    ...row,
+    store: Array.isArray(row.store) ? (row.store[0] ?? null) : row.store,
+    subscription: Array.isArray(row.subscription)
+      ? (row.subscription[0] ?? null)
+      : row.subscription,
+  };
 
   if (write) {
     if (!ctx.permissions.has("create") && !ctx.permissions.has("update")) {
@@ -73,7 +87,7 @@ export async function requireDealer({
     if (
       (status === "TRIALING" || status === "ACTIVE") &&
       periodEnd &&
-      periodEnd < new Date()
+      new Date(periodEnd) < new Date()
     ) {
       redirect("/dashboard/billing");
     }
@@ -89,9 +103,9 @@ export async function requireDealer({
 }
 
 export async function getDealerIdForUser(userId: string): Promise<string | null> {
-  const dealer = await prisma.dealer.findUnique({
-    where: { userId },
-    select: { id: true },
-  });
+  const dealer = unwrapMaybe(
+    await db.from("Dealer").select("id").eq("userId", userId).maybeSingle(),
+    "getDealerIdForUser",
+  );
   return dealer?.id ?? null;
 }

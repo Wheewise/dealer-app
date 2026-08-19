@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { generateOtp, sendOtpSms } from "@/lib/otp";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
+import {
+  TURNSTILE_ACTIONS,
+  TURNSTILE_FIELD,
+  verifyTurnstile,
+} from "@/lib/turnstile";
 
 function normalizePhone(raw: string): string {
   return raw.replace(/[^0-9]/g, "").slice(-10);
@@ -17,11 +22,25 @@ export async function POST(req: Request) {
   }
 
   let phone: string;
+  let captchaToken: unknown;
   try {
     const body = await req.json();
     phone = body.phone;
+    captchaToken = body[TURNSTILE_FIELD];
   } catch {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
+  // Each accepted request sends a paid SMS, so verify before spending.
+  const captcha = await verifyTurnstile(captchaToken, {
+    remoteIp: ip,
+    expectedAction: TURNSTILE_ACTIONS.sendOtp,
+  });
+  if (!captcha.ok) {
+    return NextResponse.json(
+      { error: "Verification failed. Please refresh and try again." },
+      { status: 403 },
+    );
   }
 
   if (!phone || typeof phone !== "string" || normalizePhone(phone).length < 10) {

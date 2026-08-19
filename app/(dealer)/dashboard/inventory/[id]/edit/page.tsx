@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { db, unwrapMaybe } from "@/lib/db";
 import { requireDealer } from "@/lib/dealer";
 import { updateListing } from "@/lib/actions/listings";
 import { ListingForm } from "@/components/listings/ListingForm";
@@ -18,11 +18,24 @@ export default async function EditListingPage({
   const { created } = await searchParams;
   const { dealer } = await requireDealer();
 
-  const listing = await prisma.listing.findFirst({
-    where: { id, dealerId: dealer.id },
-    include: { photos: { orderBy: { sortOrder: "asc" } } },
-  });
-  if (!listing) notFound();
+  // The dealerId filter is the ownership check — without it any dealer could
+  // open another's listing by id.
+  const row = unwrapMaybe(
+    await db
+      .from("Listing")
+      .select("*, photos:ListingPhoto(url, sortOrder)")
+      .eq("id", id)
+      .eq("dealerId", dealer.id)
+      .maybeSingle(),
+    "edit listing",
+  );
+  if (!row) notFound();
+
+  // PostgREST cannot order an embed per parent row.
+  const listing = {
+    ...row,
+    photos: [...row.photos].sort((a, b) => a.sortOrder - b.sortOrder),
+  };
 
   const action = updateListing.bind(null, listing.id);
 

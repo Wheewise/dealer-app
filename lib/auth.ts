@@ -2,10 +2,9 @@ import "./env";
 
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
-import { PrismaAdapter } from "@auth/prisma-adapter";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
-import { prisma } from "./db";
+import { db, unwrap, unwrapMaybe } from "./db";
 import { verifyOtp } from "./otp";
 
 const credentialsSchema = z.object({
@@ -23,8 +22,10 @@ function normalizePhone(phone: string): string {
   return phone.replace(/[^0-9]/g, "").slice(-10);
 }
 
+// No database adapter. Sessions are JWTs and the only provider is
+// Credentials, which never consults an adapter — the User rows this reads
+// live in Supabase and are written directly below.
 export const { handlers, auth, signIn, signOut } = NextAuth({
-  adapter: PrismaAdapter(prisma),
   session: { strategy: "jwt" },
   pages: {
     signIn: "/login",
@@ -67,10 +68,14 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           if (!valid) return null;
 
           const normalized = normalizePhone(parsed.data.phone);
-          const existing = await prisma.user.findFirst({
-            where: { phone: normalized },
-            select: { id: true, email: true, name: true, role: true },
-          });
+          const existing = unwrapMaybe(
+            await db
+              .from("User")
+              .select("id, email, name, role")
+              .eq("phone", normalized)
+              .maybeSingle(),
+            "auth: lookup by phone",
+          );
 
           if (existing) {
             return {
@@ -82,16 +87,20 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           }
 
           // Auto-create buyer account for new phone numbers (no email for phone-only users)
-          const user = await prisma.user.create({
-            data: {
-              email: null,
-              phone: normalized,
-              passwordHash: "",
-              name: `User ${normalized.slice(-4)}`,
-              role: "BUYER",
-            },
-            select: { id: true, email: true, name: true, role: true },
-          });
+          const user = unwrap(
+            await db
+              .from("User")
+              .insert({
+                email: null,
+                phone: normalized,
+                passwordHash: "",
+                name: `User ${normalized.slice(-4)}`,
+                role: "BUYER",
+              })
+              .select("id, email, name, role")
+              .single(),
+            "auth: create phone user",
+          );
 
           return {
             id: user.id,
@@ -110,45 +119,58 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           creds.dev
         ) {
           const devEmail = "dev@wheewise.local";
-          let user = await prisma.user.findUnique({
-            where: { email: devEmail },
-            select: { id: true, email: true, name: true, role: true },
-          });
+          let user = unwrapMaybe(
+            await db
+              .from("User")
+              .select("id, email, name, role")
+              .eq("email", devEmail)
+              .maybeSingle(),
+            "auth: dev user lookup",
+          );
 
           if (!user) {
-            const bcrypt = await import("bcryptjs");
-            user = await prisma.user.create({
-              data: {
-                email: devEmail,
-                passwordHash: await bcrypt.default.hash("dev-pass-ignored", 10),
-                name: "Dev Dealer",
-                role: "DEALER",
-              },
-              select: { id: true, email: true, name: true, role: true },
-            });
+            user = unwrap(
+              await db
+                .from("User")
+                .insert({
+                  email: devEmail,
+                  passwordHash: await bcrypt.hash("dev-pass-ignored", 10),
+                  name: "Dev Dealer",
+                  role: "DEALER",
+                })
+                .select("id, email, name, role")
+                .single(),
+              "auth: create dev user",
+            );
           }
 
           // Ensure dealer + store records exist
-          let dealer = await prisma.dealer.findUnique({
-            where: { userId: user.id },
-            select: { id: true },
-          });
+          const dealer = unwrapMaybe(
+            await db.from("Dealer").select("id").eq("userId", user.id).maybeSingle(),
+            "auth: dev dealer lookup",
+          );
           if (!dealer) {
-            dealer = await prisma.dealer.create({
-              data: {
-                userId: user.id,
-                businessName: "Dev Dealership",
-                city: "Bangalore",
-                phone: "9999999999",
-              },
-              select: { id: true },
-            });
-            await prisma.store.create({
-              data: {
-                dealerId: dealer.id,
-                slug: "dev-store",
-              },
-            });
+            const created = unwrap(
+              await db
+                .from("Dealer")
+                .insert({
+                  userId: user.id,
+                  businessName: "Dev Dealership",
+                  city: "Bangalore",
+                  phone: "9999999999",
+                })
+                .select("id")
+                .single(),
+              "auth: create dev dealer",
+            );
+            unwrap(
+              await db
+                .from("Store")
+                .insert({ dealerId: created.id, slug: "dev-store" })
+                .select("id")
+                .single(),
+              "auth: create dev store",
+            );
           }
 
           return {
@@ -163,16 +185,14 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         const parsed = credentialsSchema.safeParse(creds);
         if (!parsed.success) return null;
 
-        const user = await prisma.user.findUnique({
-          where: { email: parsed.data.email },
-          select: {
-            id: true,
-            email: true,
-            name: true,
-            role: true,
-            passwordHash: true,
-          },
-        });
+        const user = unwrapMaybe(
+          await db
+            .from("User")
+            .select("id, email, name, role, passwordHash")
+            .eq("email", parsed.data.email)
+            .maybeSingle(),
+          "auth: lookup by email",
+        );
         if (!user || !user.passwordHash) return null;
 
         const ok = await bcrypt.compare(parsed.data.password, user.passwordHash);

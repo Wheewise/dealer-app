@@ -8,8 +8,8 @@ type KeyData = {
   name: string;
   keyPrefix: string | null;
   isLegacy: boolean;
-  lastUsedAt: Date | null;
-  createdAt: Date;
+  lastUsedAt: string | null;
+  createdAt: string;
 };
 
 type CreatedKey = {
@@ -17,8 +17,8 @@ type CreatedKey = {
   name: string;
   plaintextKey: string;
   keyPrefix: string;
-  lastUsedAt: Date | null;
-  createdAt: Date;
+  lastUsedAt: string | null;
+  createdAt: string;
 };
 
 export function ApiKeyManager({ existingKeys }: { existingKeys: KeyData[] }) {

@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../../lib/auth", () => ({ auth: vi.fn() }));
-vi.mock("../../lib/db", () => ({
-  prisma: { user: { findUnique: vi.fn() } },
-}));
+vi.mock("../../lib/db", async () => {
+  const { makeDbModule } = await import("../helpers/supabase-mock");
+  return makeDbModule();
+});
 vi.mock("next/navigation", () => ({
   redirect: vi.fn((to: string) => {
     throw new Error(`REDIRECT:${to}`);
@@ -11,7 +12,8 @@ vi.mock("next/navigation", () => ({
 }));
 
 import { auth } from "../../lib/auth";
-import { prisma } from "../../lib/db";
+import * as dbModule from "../../lib/db";
+import type { DbMock } from "../helpers/supabase-mock";
 import { getAuthContext, permittedDealerIds } from "../../lib/rbac/context";
 import {
   AuthenticationError,
@@ -28,7 +30,7 @@ import {
 
 type M = ReturnType<typeof vi.fn>;
 const authMock = auth as unknown as M;
-const userFindUnique = prisma.user.findUnique as unknown as M;
+const dbMock = (dbModule as unknown as { __mock: DbMock }).__mock;
 
 type Row = {
   id: string;
@@ -43,9 +45,10 @@ type Row = {
  */
 function signIn(row: Row | null, claimedRole = row?.role) {
   authMock.mockResolvedValue(row ? { user: { id: row.id, role: claimedRole } } : null);
-  userFindUnique.mockResolvedValue(
-    row ? { ...row, email: `${row.id}@example.com`, name: row.id } : null,
-  );
+  // A standing answer, not a queued one: every guard re-reads the User row.
+  dbMock.on("User", {
+    data: row ? { ...row, email: `${row.id}@example.com`, name: row.id } : null,
+  });
 }
 
 const BUYER: Row = { id: "u_buyer", role: "BUYER", dealer: null };
@@ -69,6 +72,7 @@ const SUPER_ADMIN: Row = { id: "u_super", role: "SUPER_ADMIN", dealer: null };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  dbMock.reset();
 });
 
 describe("getAuthContext — identity is derived, never supplied", () => {
@@ -79,7 +83,7 @@ describe("getAuthContext — identity is derived, never supplied", () => {
 
   it("returns null when the session names a user that no longer exists", async () => {
     authMock.mockResolvedValue({ user: { id: "ghost", role: "ADMIN" } });
-    userFindUnique.mockResolvedValue(null);
+    dbMock.on("User", { data: null });
     expect(await getAuthContext()).toBeNull();
   });
 
@@ -95,9 +99,11 @@ describe("getAuthContext — identity is derived, never supplied", () => {
     signIn(DEALER_A);
     const ctx = await getAuthContext();
     expect(ctx?.dealerId).toBe("dealer_A");
-    expect(userFindUnique).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: "u_dealer_a" } }),
-    );
+    // Scoped by the id from the session, not by anything the caller supplied.
+    expect(dbMock.callFor("User")?.filters).toContainEqual({
+      method: "eq",
+      args: ["id", "u_dealer_a"],
+    });
   });
 });
 

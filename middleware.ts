@@ -13,11 +13,14 @@ function buildCsp(nonce: string): string {
   // React + Turbopack use eval() in dev for HMR and callstack reconstruction.
   // 'strict-dynamic' ignores host/source allowlists but NOT 'unsafe-eval',
   // so this only loosens eval and only in development.
+  // Hosts are listed alongside 'strict-dynamic' as a fallback: browsers that
+  // support strict-dynamic ignore them, older ones use them.
   const scriptSrc = [
     "script-src 'self'",
     `'nonce-${nonce}'`,
     "'strict-dynamic'",
     "https://checkout.razorpay.com",
+    "https://challenges.cloudflare.com",
     isDev ? "'unsafe-eval'" : "",
   ]
     .filter(Boolean)
@@ -27,6 +30,7 @@ function buildCsp(nonce: string): string {
     "connect-src 'self'",
     "https://api.razorpay.com",
     "https://lumberjack.razorpay.com",
+    "https://challenges.cloudflare.com",
     isDev ? "ws: wss:" : "",
   ]
     .filter(Boolean)
@@ -39,7 +43,7 @@ function buildCsp(nonce: string): string {
     "img-src 'self' data: blob: https:",
     "font-src 'self' data:",
     connectSrc,
-    "frame-src https://api.razorpay.com https://checkout.razorpay.com",
+    "frame-src https://api.razorpay.com https://checkout.razorpay.com https://challenges.cloudflare.com",
     "frame-ancestors 'none'",
     "form-action 'self'",
     "base-uri 'self'",

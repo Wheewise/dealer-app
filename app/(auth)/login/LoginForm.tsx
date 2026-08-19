@@ -4,6 +4,7 @@ import { useActionState } from "react";
 import { useSearchParams } from "next/navigation";
 import { loginAction, type LoginState } from "@/lib/actions/auth";
 import { Field, Input, Button } from "@/components/ui/Field";
+import { Turnstile } from "@/components/common/Turnstile";
 
 export function LoginForm() {
   const [state, formAction, pending] = useActionState<LoginState, FormData>(
@@ -34,6 +35,7 @@ export function LoginForm() {
           {state.error}
         </p>
       ) : null}
+      <Turnstile action="login" />
       <Button type="submit" disabled={pending} className="w-full">
         {pending ? "Signing in…" : "Sign in"}
       </Button>

@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { requireDealer } from "@/lib/dealer";
 import { getDealerPayouts } from "@/lib/actions/admin";
-import { prisma } from "@/lib/db";
+import { db, unwrap } from "@/lib/db";
 import { razorpay } from "@/lib/razorpay";
 import { isBillingEnabled } from "@/lib/billing";
 import { CheckoutButton } from "./CheckoutButton";
@@ -57,8 +57,8 @@ const FAQS = [
   },
 ];
 
-function daysUntil(date: Date): number {
-  return Math.ceil((date.getTime() - Date.now()) / 86_400_000);
+function daysUntil(iso: string): number {
+  return Math.ceil((new Date(iso).getTime() - Date.now()) / 86_400_000);
 }
 
 export default async function BillingPage() {
@@ -80,11 +80,14 @@ export default async function BillingPage() {
 
   const [payouts, payments] = await Promise.all([
     getDealerPayouts(dealer.id),
-    prisma.payment.findMany({
-      where: { dealerId: dealer.id, kind: "SUBSCRIPTION" },
-      orderBy: { createdAt: "desc" },
-      take: 20,
-    }),
+    db
+      .from("Payment")
+      .select("*")
+      .eq("dealerId", dealer.id)
+      .eq("kind", "SUBSCRIPTION")
+      .order("createdAt", { ascending: false })
+      .limit(20)
+      .then((r) => unwrap(r, "billing: payments")),
   ]);
 
   return (
@@ -151,7 +154,7 @@ export default async function BillingPage() {
           <div className="mt-1 text-sm text-zinc-500">
             Status: {sub.status}
             {sub.currentPeriodEnd
-              ? ` · ${sub.status === "TRIALING" ? "Trial ends" : "Renews"} ${sub.currentPeriodEnd.toLocaleDateString()}`
+              ? ` · ${sub.status === "TRIALING" ? "Trial ends" : "Renews"} ${new Date(sub.currentPeriodEnd).toLocaleDateString()}`
               : ""}
           </div>
         ) : null}
@@ -265,7 +268,9 @@ export default async function BillingPage() {
               <tbody className="divide-border-default divide-y">
                 {payments.map((p) => (
                   <tr key={p.id}>
-                    <td className="px-4 py-2">{p.createdAt.toLocaleDateString("en-IN")}</td>
+                    <td className="px-4 py-2">
+                      {new Date(p.createdAt).toLocaleDateString("en-IN")}
+                    </td>
                     <td className="px-4 py-2 text-right tabular-nums">
                       ₹{(p.amount / 100).toLocaleString("en-IN")}
                     </td>

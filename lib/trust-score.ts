@@ -1,6 +1,7 @@
 type DealerMetrics = {
   gstVerified: boolean;
-  accountCreatedAt: Date;
+  /** Date, or the ISO-8601 string the database hands back. */
+  accountCreatedAt: Date | string;
   soldCount: number;
   listingCount: number;
   avgResponseHours: number | null;
@@ -14,7 +15,8 @@ export function computeTrustScore(metrics: DealerMetrics): number {
 
   // Account age: +5 per 6 months, max 20
   const accountMonths =
-    (Date.now() - metrics.accountCreatedAt.getTime()) / (1000 * 60 * 60 * 24 * 30);
+    (Date.now() - new Date(metrics.accountCreatedAt).getTime()) /
+    (1000 * 60 * 60 * 24 * 30);
   score += Math.min(20, Math.floor(accountMonths / 6) * 5);
 
   // Sales: +10 per 10 sold, max 30

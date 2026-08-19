@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/db";
+import { db, unwrap, unwrapMaybe } from "@/lib/db";
 import { apiRequirePermission, type AuthContext } from "@/lib/rbac";
 
 /**
@@ -11,10 +11,14 @@ async function isParticipant(
   conversationId: string,
   ctx: AuthContext,
 ): Promise<boolean> {
-  const conversation = await prisma.conversation.findUnique({
-    where: { id: conversationId },
-    select: { buyerId: true, dealerId: true },
-  });
+  const conversation = unwrapMaybe(
+    await db
+      .from("Conversation")
+      .select("buyerId, dealerId")
+      .eq("id", conversationId)
+      .maybeSingle(),
+    "isParticipant",
+  );
   if (!conversation) return false;
   if (conversation.buyerId === ctx.userId) return true;
   if (ctx.role === "DEALER" && ctx.dealerId && conversation.dealerId === ctx.dealerId) {
@@ -38,33 +42,29 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  const messages = await prisma.message.findMany({
-    where: { conversationId },
-    orderBy: { createdAt: "asc" },
-    select: {
-      id: true,
-      senderId: true,
-      body: true,
-      createdAt: true,
-      readAt: true,
-    },
-    take: 100,
-  });
+  const messages = unwrap(
+    await db
+      .from("Message")
+      .select("id, senderId, body, createdAt, readAt")
+      .eq("conversationId", conversationId)
+      .order("createdAt", { ascending: true })
+      .limit(100),
+    "GET /api/chat/messages",
+  );
 
-  type Message = (typeof messages)[number];
   const unreadIds = messages
-    .filter((m: Message) => m.senderId !== gate.ctx.userId && !m.readAt)
-    .map((m: Message) => m.id);
+    .filter((m) => m.senderId !== gate.ctx.userId && !m.readAt)
+    .map((m) => m.id);
 
   if (unreadIds.length > 0) {
-    // updateMany runs as a multi-statement transaction, which the Cloudflare
-    // Workers Neon HTTP adapter can't do (see lib/db.ts) — update each row
-    // individually instead.
-    const readAt = new Date();
-    await Promise.all(
-      unreadIds.map((id: string) =>
-        prisma.message.update({ where: { id }, data: { readAt } }),
-      ),
+    // One statement for the whole batch.
+    unwrap(
+      await db
+        .from("Message")
+        .update({ readAt: new Date().toISOString() })
+        .in("id", unreadIds)
+        .select("id"),
+      "mark messages read",
     );
   }
 
@@ -96,18 +96,21 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  const message = await prisma.message.create({
-    data: {
-      conversationId,
-      senderId: gate.ctx.userId,
-      body: body.trim(),
-    },
-  });
-
-  await prisma.conversation.update({
-    where: { id: conversationId },
-    data: { lastMessageAt: new Date() },
-  });
+  // Conversation.lastMessageAt is stamped by the insert trigger (see
+  // supabase/schema.sql), so the chat-list ordering cannot drift out of step
+  // with the messages themselves.
+  const message = unwrap(
+    await db
+      .from("Message")
+      .insert({
+        conversationId,
+        senderId: gate.ctx.userId,
+        body: body.trim(),
+      })
+      .select("id, senderId, body, createdAt, readAt")
+      .single(),
+    "POST /api/chat/messages",
+  );
 
   return NextResponse.json(
     {

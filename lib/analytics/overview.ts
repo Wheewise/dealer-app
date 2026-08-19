@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/db";
+import { db, DbError } from "@/lib/db";
 import type { ChangeMetric } from "./types";
 
 export interface OverviewData {
@@ -14,6 +14,24 @@ export interface OverviewData {
   conversionRate: ChangeMetric;
 }
 
+/** Shape of `dealer_overview_metrics()` in supabase/schema.sql. */
+interface OverviewCounts {
+  totalListings: number;
+  activeListings: number;
+  soldListings: number;
+  pausedListings: number;
+  newCur: number;
+  newPrev: number;
+  leadsCur: number;
+  leadsPrev: number;
+  viewsCur: number;
+  viewsPrev: number;
+  uvCur: number;
+  uvPrev: number;
+  wlCur: number;
+  wlPrev: number;
+}
+
 function pctChange(current: number, prev: number): number {
   if (prev === 0) return current > 0 ? 100 : 0;
   return Math.round(((current - prev) / prev) * 100);
@@ -27,73 +45,30 @@ export async function getOverviewMetrics(
   dealerId: string,
   days: number,
 ): Promise<OverviewData> {
-  const now = new Date();
-  const cur  = new Date(now.getTime() - days * 86_400_000);
-  const prev = new Date(now.getTime() - days * 86_400_000 * 2);
+  // Fourteen counts, one round trip. The distinct-visitor tallies in
+  // particular used to page every ListingView row into the app to measure
+  // the size of the result.
+  const { data, error } = await db.rpc("dealer_overview_metrics", {
+    p_dealer_id: dealerId,
+    p_days: days,
+  });
+  if (error) throw new DbError(error, "getOverviewMetrics");
 
-  const [
-    totalListings,
-    activeListings,
-    soldListings,
-    pausedListings,
-    newCur,
-    newPrev,
-    leadsCur,
-    leadsPrev,
-    viewsCur,
-    viewsPrev,
-    uvCur,
-    uvPrev,
-    wlCur,
-    wlPrev,
-  ] = await Promise.all([
-    prisma.listing.count({ where: { dealerId } }),
-    prisma.listing.count({ where: { dealerId, status: "ACTIVE" } }),
-    prisma.listing.count({ where: { dealerId, status: "SOLD" } }),
-    prisma.listing.count({ where: { dealerId, status: "PAUSED" } }),
-    prisma.listing.count({ where: { dealerId, createdAt: { gte: cur } } }),
-    prisma.listing.count({ where: { dealerId, createdAt: { gte: prev, lt: cur } } }),
-    prisma.enquiry.count({ where: { dealerId, createdAt: { gte: cur } } }),
-    prisma.enquiry.count({ where: { dealerId, createdAt: { gte: prev, lt: cur } } }),
-    prisma.listingView.count({
-      where: { listing: { dealerId }, createdAt: { gte: cur } },
-    }),
-    prisma.listingView.count({
-      where: { listing: { dealerId }, createdAt: { gte: prev, lt: cur } },
-    }),
-    prisma.listingView
-      .groupBy({
-        by: ["visitorId"],
-        where: { listing: { dealerId }, createdAt: { gte: cur } },
-      })
-      .then((r) => r.length),
-    prisma.listingView
-      .groupBy({
-        by: ["visitorId"],
-        where: { listing: { dealerId }, createdAt: { gte: prev, lt: cur } },
-      })
-      .then((r) => r.length),
-    prisma.savedListing.count({
-      where: { listing: { dealerId }, createdAt: { gte: cur } },
-    }),
-    prisma.savedListing.count({
-      where: { listing: { dealerId }, createdAt: { gte: prev, lt: cur } },
-    }),
-  ]);
+  const c = data as unknown as OverviewCounts;
 
-  const convCur  = viewsCur  > 0 ? +((leadsCur  / viewsCur)  * 100).toFixed(1) : 0;
-  const convPrev = viewsPrev > 0 ? +((leadsPrev / viewsPrev) * 100).toFixed(1) : 0;
+  const convCur = c.viewsCur > 0 ? +((c.leadsCur / c.viewsCur) * 100).toFixed(1) : 0;
+  const convPrev = c.viewsPrev > 0 ? +((c.leadsPrev / c.viewsPrev) * 100).toFixed(1) : 0;
 
   return {
-    totalListings,
-    activeListings,
-    soldListings,
-    pausedListings,
-    newListings:    metric(newCur,   newPrev),
-    totalLeads:     metric(leadsCur, leadsPrev),
-    totalViews:     metric(viewsCur, viewsPrev),
-    uniqueVisitors: metric(uvCur,    uvPrev),
-    wishlistAdds:   metric(wlCur,    wlPrev),
-    conversionRate: metric(convCur,  convPrev),
+    totalListings: c.totalListings,
+    activeListings: c.activeListings,
+    soldListings: c.soldListings,
+    pausedListings: c.pausedListings,
+    newListings: metric(c.newCur, c.newPrev),
+    totalLeads: metric(c.leadsCur, c.leadsPrev),
+    totalViews: metric(c.viewsCur, c.viewsPrev),
+    uniqueVisitors: metric(c.uvCur, c.uvPrev),
+    wishlistAdds: metric(c.wlCur, c.wlPrev),
+    conversionRate: metric(convCur, convPrev),
   };
 }

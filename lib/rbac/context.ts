@@ -1,5 +1,5 @@
 import { auth } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { db, unwrapMaybe } from "@/lib/db";
 import {
   appFor,
   isAdminRole,
@@ -48,20 +48,21 @@ export async function getAuthContext(): Promise<AuthContext | null> {
   const userId = session?.user?.id;
   if (!userId) return null;
 
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: {
-      id: true,
-      email: true,
-      name: true,
-      role: true,
-      dealer: { select: { id: true, status: true } },
-    },
-  });
+  // Dealer is a to-one embed (Dealer.userId is unique), so PostgREST returns
+  // an object or null rather than an array.
+  const user = unwrapMaybe(
+    await db
+      .from("User")
+      .select("id, email, name, role, dealer:Dealer(id, status)")
+      .eq("id", userId)
+      .maybeSingle(),
+    "authContext",
+  );
   // User deleted since the token was issued — treat as unauthenticated.
   if (!user) return null;
 
   const role = user.role as AppRole;
+  const dealer = Array.isArray(user.dealer) ? user.dealer[0] : user.dealer;
 
   return {
     userId: user.id,
@@ -70,8 +71,8 @@ export async function getAuthContext(): Promise<AuthContext | null> {
     role,
     app: appFor(role),
     permissions: permissionsFor(role),
-    dealerId: user.dealer?.id ?? null,
-    dealerStatus: user.dealer?.status ?? null,
+    dealerId: dealer?.id ?? null,
+    dealerStatus: dealer?.status ?? null,
     isAdmin: isAdminRole(role),
   };
 }

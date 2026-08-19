@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/db";
+import { db, DbError, unwrap } from "@/lib/db";
 import type { InventoryDistribution, TopListing } from "./types";
 
 export interface InventoryAnalytics {
@@ -10,53 +10,38 @@ export interface InventoryAnalytics {
   avgDaysListed: number;
 }
 
+/** Shape of `dealer_inventory_breakdown()` in supabase/schema.sql. */
+interface Breakdown {
+  byStatus: InventoryDistribution[];
+  byVehicleType: InventoryDistribution[];
+  byFuelType: InventoryDistribution[];
+  byMake: InventoryDistribution[];
+}
+
 export async function getInventoryAnalytics(
   dealerId: string,
 ): Promise<InventoryAnalytics> {
-  const [byStatus, byVehicleType, byFuelType, byMake, listings] = await Promise.all([
-    prisma.listing.groupBy({
-      by: ["status"],
-      where: { dealerId },
-      _count: { status: true },
-    }),
-    prisma.listing.groupBy({
-      by: ["vehicleType"],
-      where: { dealerId },
-      _count: { vehicleType: true },
-    }),
-    prisma.listing.groupBy({
-      by: ["fuelType"],
-      where: { dealerId },
-      _count: { fuelType: true },
-    }),
-    prisma.listing.groupBy({
-      by: ["make"],
-      where: { dealerId },
-      _count: { make: true },
-      orderBy: { _count: { make: "desc" } },
-      take: 8,
-    }),
-    prisma.listing.findMany({
-      where: { dealerId },
-      select: {
-        id: true,
-        make: true,
-        model: true,
-        year: true,
-        status: true,
-        viewCount: true,
-        enquiryCount: true,
-        createdAt: true,
-      },
-      orderBy: { viewCount: "desc" },
-      take: 20,
-    }),
+  const [breakdownResult, listings] = await Promise.all([
+    // Four GROUP BYs, which PostgREST cannot express.
+    db.rpc("dealer_inventory_breakdown", { p_dealer_id: dealerId }),
+    db
+      .from("Listing")
+      .select("id, make, model, year, status, viewCount, enquiryCount, createdAt")
+      .eq("dealerId", dealerId)
+      .order("viewCount", { ascending: false })
+      .limit(20)
+      .then((r) => unwrap(r, "getInventoryAnalytics listings")),
   ]);
+
+  if (breakdownResult.error) {
+    throw new DbError(breakdownResult.error, "getInventoryAnalytics breakdown");
+  }
+  const breakdown = breakdownResult.data as unknown as Breakdown;
 
   const now = Date.now();
 
   const topListings: TopListing[] = listings.map((l) => {
-    const daysListed = Math.floor((now - l.createdAt.getTime()) / 86_400_000);
+    const daysListed = Math.floor((now - new Date(l.createdAt).getTime()) / 86_400_000);
     return {
       id: l.id,
       make: l.make,
@@ -75,17 +60,18 @@ export async function getInventoryAnalytics(
     active.length > 0
       ? Math.round(
           active.reduce(
-            (s, l) => s + Math.floor((now - l.createdAt.getTime()) / 86_400_000),
+            (s, l) =>
+              s + Math.floor((now - new Date(l.createdAt).getTime()) / 86_400_000),
             0,
           ) / active.length,
         )
       : 0;
 
   return {
-    byStatus:      byStatus.map((b) => ({ label: b.status,      count: b._count.status })),
-    byVehicleType: byVehicleType.map((b) => ({ label: b.vehicleType, count: b._count.vehicleType })),
-    byFuelType:    byFuelType.map((b) => ({ label: b.fuelType,   count: b._count.fuelType })),
-    byMake:        byMake.map((b) => ({ label: b.make,           count: b._count.make })),
+    byStatus: breakdown.byStatus,
+    byVehicleType: breakdown.byVehicleType,
+    byFuelType: breakdown.byFuelType,
+    byMake: breakdown.byMake,
     topListings,
     avgDaysListed,
   };

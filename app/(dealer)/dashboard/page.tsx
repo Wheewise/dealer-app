@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { prisma } from "@/lib/db";
+import { count, db, unwrap } from "@/lib/db";
 import { requireDealer } from "@/lib/dealer";
 import { Button } from "@/components/ui/Field";
 import { siteUrl } from "@/lib/site-url";
@@ -13,39 +13,53 @@ function daysUntil(date: Date): number {
 export default async function DashboardPage() {
   const { dealer } = await requireDealer();
 
-  const [activeListings, totalLeads, viewSum, recentLeads] = await Promise.all([
-    prisma.listing.count({
-      where: { dealerId: dealer.id, status: "ACTIVE" },
-    }),
-    prisma.enquiry.count({
-      where: { listing: { dealerId: dealer.id } },
-    }),
-    prisma.listing.aggregate({
-      where: { dealerId: dealer.id },
-      _sum: { viewCount: true, enquiryCount: true },
-    }),
-    prisma.enquiry.findMany({
-      where: { listing: { dealerId: dealer.id } },
-      orderBy: [{ priority: "desc" }, { createdAt: "desc" }],
-      take: 5,
-      include: { listing: { select: { make: true, model: true, year: true } } },
-    }),
+  const [activeListings, totalLeads, counters, recentLeads] = await Promise.all([
+    count(
+      db
+        .from("Listing")
+        .select("id", { count: "exact", head: true })
+        .eq("dealerId", dealer.id)
+        .eq("status", "ACTIVE"),
+    ),
+    count(
+      db
+        .from("Enquiry")
+        .select("id", { count: "exact", head: true })
+        .eq("dealerId", dealer.id),
+    ),
+    // SUM has no PostgREST equivalent. The two counters are per-listing and
+    // this dealer's inventory is small, so they are added here.
+    db
+      .from("Listing")
+      .select("viewCount, enquiryCount")
+      .eq("dealerId", dealer.id)
+      .then((r) => unwrap(r, "dashboard: counters")),
+    db
+      .from("Enquiry")
+      .select("*, listing:Listing(make, model, year)")
+      .eq("dealerId", dealer.id)
+      .order("priority", { ascending: false })
+      .order("createdAt", { ascending: false })
+      .limit(5)
+      .then((r) => unwrap(r, "dashboard: recent leads")),
   ]);
 
-  const totalViews = viewSum._sum.viewCount ?? 0;
-  const totalEnquiries = viewSum._sum.enquiryCount ?? 0;
+  const totalViews = counters.reduce((s, l) => s + l.viewCount, 0);
+  const totalEnquiries = counters.reduce((s, l) => s + l.enquiryCount, 0);
   const ratio =
     totalViews > 0 ? `${((totalEnquiries / totalViews) * 100).toFixed(1)}%` : "—";
 
   const sub = dealer.subscription;
+  const periodEnd = sub ? new Date(sub.currentPeriodEnd) : null;
   const subLabel = sub
     ? sub.status === "TRIALING"
-      ? `Free trial · ends ${sub.currentPeriodEnd.toLocaleDateString()}`
+      ? `Free trial · ends ${periodEnd!.toLocaleDateString()}`
       : `${sub.plan} · ${sub.status}`
     : "No subscription";
 
   const billingOn = isBillingEnabled();
-  const trialDaysLeft = sub?.status === "TRIALING" ? daysUntil(sub.currentPeriodEnd) : null;
+  const trialDaysLeft =
+    sub?.status === "TRIALING" && periodEnd ? daysUntil(periodEnd) : null;
   const showTrialWarning = billingOn && trialDaysLeft !== null && trialDaysLeft <= 7;
 
   const storeUrl = siteUrl(`/s/${dealer.store?.slug ?? ""}`);
@@ -117,18 +131,20 @@ export default async function DashboardPage() {
           </div>
         ) : (
           <ul className="divide-border-default divide-y">
-            {recentLeads.map((lead) => (
-              <li key={lead.id} className="flex items-center justify-between px-5 py-3">
-                <div>
-                  <div className="text-sm font-medium">{lead.buyerName}</div>
-                  <div className="text-xs text-zinc-500">
-                    {lead.listing.year} {lead.listing.make} {lead.listing.model} ·{" "}
-                    {lead.buyerPhone}
+            {recentLeads.map((lead) => {
+              const listing = Array.isArray(lead.listing) ? lead.listing[0] : lead.listing;
+              return (
+                <li key={lead.id} className="flex items-center justify-between px-5 py-3">
+                  <div>
+                    <div className="text-sm font-medium">{lead.buyerName}</div>
+                    <div className="text-xs text-zinc-500">
+                      {listing?.year} {listing?.make} {listing?.model} · {lead.buyerPhone}
+                    </div>
                   </div>
-                </div>
-                <div className="text-xs text-zinc-500">{timeAgo(lead.createdAt)}</div>
-              </li>
-            ))}
+                  <div className="text-xs text-zinc-500">{timeAgo(lead.createdAt)}</div>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>
@@ -159,8 +175,8 @@ function Kpi({
   );
 }
 
-function timeAgo(d: Date): string {
-  const diff = Date.now() - d.getTime();
+function timeAgo(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
   const m = Math.floor(diff / 60000);
   if (m < 1) return "just now";
   if (m < 60) return `${m}m ago`;

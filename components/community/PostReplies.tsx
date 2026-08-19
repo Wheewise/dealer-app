@@ -7,7 +7,7 @@ import { createReply } from "@/lib/actions/community";
 type ReplyData = {
   id: string;
   body: string;
-  createdAt: Date;
+  createdAt: string;
   // No email: public forum reads no longer expose author addresses.
   author: { name: string | null };
 };

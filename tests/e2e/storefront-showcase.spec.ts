@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-// Relies on the demo seed (npm run db:seed) — slug from prisma/seed.ts.
+// Relies on the demo seed (npm run db:seed) — slug from supabase/seed.ts.
 const SLUG = process.env.E2E_DEMO_SLUG ?? "sharma-auto-indore";
 
 test("dealer showcase renders all major sections", async ({ page }) => {

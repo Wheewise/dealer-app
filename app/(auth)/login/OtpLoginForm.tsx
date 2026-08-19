@@ -4,6 +4,7 @@ import { useState, useCallback } from "react";
 import { signIn, getSession } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/Field";
+import { Turnstile } from "@/components/common/Turnstile";
 import { roleRedirectPath, safeCallbackPath } from "@/lib/role-redirect";
 
 export function OtpLoginForm() {
@@ -15,6 +16,7 @@ export function OtpLoginForm() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState("");
 
   const sendOtp = useCallback(async () => {
     const cleaned = phone.replace(/[^0-9]/g, "");
@@ -28,7 +30,7 @@ export function OtpLoginForm() {
       const res = await fetch("/api/auth/send-otp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone: cleaned }),
+        body: JSON.stringify({ phone: cleaned, "cf-turnstile-response": captchaToken }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -41,7 +43,7 @@ export function OtpLoginForm() {
     } finally {
       setSending(false);
     }
-  }, [phone]);
+  }, [phone, captchaToken]);
 
   const verifyOtp = useCallback(async () => {
     if (otp.length !== 6) {
@@ -97,6 +99,7 @@ export function OtpLoginForm() {
               {error}
             </p>
           ) : null}
+          <Turnstile action="send-otp" onVerify={setCaptchaToken} />
           <Button type="button" onClick={sendOtp} disabled={sending} className="w-full">
             {sending ? "Sending…" : "Send OTP"}
           </Button>

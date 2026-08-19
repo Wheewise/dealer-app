@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { Turnstile } from "@/components/common/Turnstile";
 
 export type InquiryListingOption = {
   id: string;
@@ -26,6 +27,7 @@ export function StorefrontInquiryForm({ listings, defaultListingId, accent }: Pr
   const [message, setMessage] = useState("");
   const [listingId, setListingId] = useState(defaultListingId ?? listings[0]?.id ?? "");
   const [status, setStatus] = useState<Status>({ kind: "idle" });
+  const [captchaToken, setCaptchaToken] = useState("");
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -47,6 +49,7 @@ export function StorefrontInquiryForm({ listings, defaultListingId, accent }: Pr
           buyerPhone: phone,
           buyerEmail: email || undefined,
           message: message || undefined,
+          "cf-turnstile-response": captchaToken,
         }),
       });
       const body = await res.json().catch(() => ({}));
@@ -185,6 +188,8 @@ export function StorefrontInquiryForm({ listings, defaultListingId, accent }: Pr
           {status.message}
         </div>
       ) : null}
+
+      <Turnstile action="lead" onVerify={setCaptchaToken} className="pt-1" />
 
       <button
         type="submit"

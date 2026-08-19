@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { apiRequireDealer } from "@/lib/rbac";
-import { prisma } from "@/lib/db";
+import { db, unwrapMaybe } from "@/lib/db";
 import { razorpay, BOOST_PLANS } from "@/lib/razorpay";
 
 export async function POST(req: Request) {
@@ -31,10 +31,15 @@ export async function POST(req: Request) {
     );
   }
 
-  const listing = await prisma.listing.findFirst({
-    where: { id: listingId, dealerId: dealer.id },
-    select: { id: true },
-  });
+  const listing = unwrapMaybe(
+    await db
+      .from("Listing")
+      .select("id")
+      .eq("id", listingId)
+      .eq("dealerId", dealer.id!)
+      .maybeSingle(),
+    "POST /api/dealer/boost",
+  );
   if (!listing) {
     return NextResponse.json({ error: "Listing not found" }, { status: 404 });
   }

@@ -1,14 +1,18 @@
 import { requireDealer } from "@/lib/dealer";
-import { prisma } from "@/lib/db";
+import { db, unwrap } from "@/lib/db";
 import { ApiKeyManager } from "./ApiKeyManager";
 
 export default async function ApiKeysPage() {
   const { dealer } = await requireDealer();
 
-  const keys = await prisma.apiKey.findMany({
-    where: { dealerId: dealer.id },
-    orderBy: { createdAt: "desc" },
-  });
+  const keys = unwrap(
+    await db
+      .from("ApiKey")
+      .select("*")
+      .eq("dealerId", dealer.id)
+      .order("createdAt", { ascending: false }),
+    "api-keys",
+  );
   type ApiKey = (typeof keys)[number];
 
   return (

@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { prisma } from "@/lib/db";
+import { db, isUniqueViolation, unwrapMaybe } from "@/lib/db";
 import { requireDealer } from "@/lib/dealer";
 import { storeSchema } from "@/lib/validators/store";
 
@@ -34,25 +34,35 @@ export async function updateStore(
   }
 
   if (parsed.data.slug !== dealer.store.slug) {
-    const taken = await prisma.store.findUnique({
-      where: { slug: parsed.data.slug },
-      select: { id: true },
-    });
+    const taken = unwrapMaybe(
+      await db.from("Store").select("id").eq("slug", parsed.data.slug).maybeSingle(),
+      "updateStore: slug check",
+    );
     if (taken) {
       return { ok: false, errors: { slug: ["This URL is already taken"] } };
     }
   }
 
-  const updated = await prisma.store.update({
-    where: { dealerId: dealer.id },
-    data: {
+  // Store_slug_key is the real arbiter — the read above can lose a race with
+  // another dealer claiming the same URL between the check and the write.
+  const { data: updated, error } = await db
+    .from("Store")
+    .update({
       slug: parsed.data.slug,
       bio: parsed.data.bio || null,
       primaryColor: parsed.data.primaryColor,
       logoUrl: parsed.data.logoUrl || null,
       bannerUrl: parsed.data.bannerUrl || null,
-    },
-  });
+    })
+    .eq("dealerId", dealer.id)
+    .select("slug")
+    .single();
+  if (error) {
+    if (isUniqueViolation(error)) {
+      return { ok: false, errors: { slug: ["This URL is already taken"] } };
+    }
+    return { ok: false, errors: {}, formError: "Could not save your storefront." };
+  }
 
   revalidatePath("/dashboard");
   revalidatePath("/dashboard/store");

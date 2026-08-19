@@ -3,6 +3,7 @@
 import { useActionState } from "react";
 import { signupDealer, type SignupState } from "@/lib/actions/auth";
 import { Field, Input, Button } from "@/components/ui/Field";
+import { Turnstile } from "@/components/common/Turnstile";
 
 export function DealerSignupForm() {
   const [state, formAction, pending] = useActionState<SignupState | undefined, FormData>(
@@ -67,6 +68,12 @@ export function DealerSignupForm() {
       >
         <Input id="whatsapp" name="whatsapp" type="tel" inputMode="tel" />
       </Field>
+      {errors.form ? (
+        <p className="bg-brand-red/10 text-brand-red rounded-md px-3 py-2 text-sm">
+          {errors.form[0]}
+        </p>
+      ) : null}
+      <Turnstile action="signup-dealer" />
       <Button type="submit" disabled={pending} className="w-full">
         {pending ? "Creating dealer account…" : "Start 14-day free trial"}
       </Button>

@@ -5,14 +5,19 @@ import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import bcrypt from "bcryptjs";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
-import { prisma } from "@/lib/db";
+import { db, isUniqueViolation, unwrap, unwrapMaybe } from "@/lib/db";
 import { signIn } from "@/lib/auth";
 import { roleRedirectPath, safeCallbackPath } from "@/lib/role-redirect";
 
 import { passwordRule } from "@/lib/password";
 import { rateLimit, getClientIpFromHeaders } from "@/lib/rate-limit";
 import { logSecurityEvent } from "@/lib/rbac";
+import {
+  TURNSTILE_ACTIONS,
+  TURNSTILE_FIELD,
+  verifyTurnstile,
+} from "@/lib/turnstile";
+import { getClientIpFromHeaders as clientIp } from "@/lib/rate-limit";
 
 const baseSignupSchema = z.object({
   name: z.string().min(2, "Name is too short"),
@@ -58,6 +63,16 @@ export async function signupBuyer(
   _prev: SignupState | undefined,
   formData: FormData,
 ): Promise<SignupState> {
+  // Fake-account creation is the abuse this blocks; it runs before any
+  // database work so a bot cannot even probe for taken emails.
+  const captcha = await verifyTurnstile(formData.get(TURNSTILE_FIELD), {
+    remoteIp: clientIp(await headers()),
+    expectedAction: TURNSTILE_ACTIONS.signupBuyer,
+  });
+  if (!captcha.ok) {
+    return { ok: false, errors: { form: ["Verification failed. Please refresh and try again."] } };
+  }
+
   const parsed = buyerSignupSchema.safeParse({
     name: formData.get("name"),
     email: formData.get("email"),
@@ -73,29 +88,47 @@ export async function signupBuyer(
 
   const normalizedPhone = normalizePhone(parsed.data.phone);
 
-  const existing = await prisma.user.findFirst({
-    where: { OR: [{ email: parsed.data.email }, { phone: normalizedPhone }] },
-    select: { email: true, phone: true },
-  });
-  if (existing?.email === parsed.data.email) {
+  const clashes = unwrap(
+    await db
+      .from("User")
+      .select("email, phone")
+      .or(`email.eq.${parsed.data.email},phone.eq.${normalizedPhone}`),
+    "signupBuyer: clash check",
+  );
+  if (clashes.some((u) => u.email === parsed.data.email)) {
     return { ok: false, errors: { email: ["Email already in use"] } };
   }
-  if (existing?.phone === normalizedPhone) {
+  if (clashes.some((u) => u.phone === normalizedPhone)) {
     return { ok: false, errors: { phone: ["Phone number already in use"] } };
   }
 
   const passwordHash = await bcrypt.hash(parsed.data.password, 12);
-  await prisma.user.create({
-    data: {
-      email: parsed.data.email,
-      phone: normalizedPhone,
-      name: parsed.data.name,
-      passwordHash,
-      district: parsed.data.district,
-      state: parsed.data.state,
-      role: "BUYER",
-    },
+  // The check above races; the unique indexes are what actually decide, so a
+  // concurrent signup surfaces as the same field error rather than a 500.
+  const { error: insertError } = await db.from("User").insert({
+    email: parsed.data.email,
+    phone: normalizedPhone,
+    name: parsed.data.name,
+    passwordHash,
+    district: parsed.data.district,
+    state: parsed.data.state,
+    role: "BUYER",
   });
+  if (insertError) {
+    if (isUniqueViolation(insertError)) {
+      const field = insertError.message.includes("phone") ? "phone" : "email";
+      return {
+        ok: false,
+        errors: {
+          [field]: [
+            field === "phone" ? "Phone number already in use" : "Email already in use",
+          ],
+        },
+      };
+    }
+    console.error("[signupBuyer] user insert failed:", insertError);
+    throw new Error(insertError.message);
+  }
 
   await signIn("credentials", {
     email: parsed.data.email,
@@ -120,7 +153,12 @@ async function generateUniqueSlug(base: string): Promise<string> {
   const root = slugify(base) || "store";
   let slug = root;
   let i = 1;
-  while (await prisma.store.findUnique({ where: { slug }, select: { id: true } })) {
+  while (
+    unwrapMaybe(
+      await db.from("Store").select("id").eq("slug", slug).maybeSingle(),
+      "generateUniqueSlug",
+    )
+  ) {
     slug = `${root}-${++i}`;
   }
   return slug;
@@ -130,6 +168,14 @@ export async function signupDealer(
   _prev: SignupState | undefined,
   formData: FormData,
 ): Promise<SignupState> {
+  const captcha = await verifyTurnstile(formData.get(TURNSTILE_FIELD), {
+    remoteIp: clientIp(await headers()),
+    expectedAction: TURNSTILE_ACTIONS.signupDealer,
+  });
+  if (!captcha.ok) {
+    return { ok: false, errors: { form: ["Verification failed. Please refresh and try again."] } };
+  }
+
   const parsed = dealerSignupSchema.safeParse({
     name: formData.get("name"),
     email: formData.get("email"),
@@ -145,12 +191,12 @@ export async function signupDealer(
 
   let existing;
   try {
-    existing = await prisma.user.findUnique({
-      where: { email: parsed.data.email },
-      select: { id: true },
-    });
+    existing = unwrapMaybe(
+      await db.from("User").select("id").eq("email", parsed.data.email).maybeSingle(),
+      "signupDealer: email check",
+    );
   } catch (err) {
-    console.error("[signupDealer] findUnique(user by email) failed:", err);
+    console.error("[signupDealer] lookup(user by email) failed:", err);
     throw err;
   }
   if (existing) {
@@ -161,98 +207,93 @@ export async function signupDealer(
   const trialEnds = new Date();
   trialEnds.setDate(trialEnds.getDate() + 14);
 
-  // Sequential single-table creates rather than one nested User->Dealer->
-  // Store/Subscription write: a nested create needs an interactive
-  // transaction, which the Cloudflare Workers Neon HTTP adapter cannot do.
-  // Each call below is one independent INSERT, so no transaction is needed.
-  // `user.delete` cascades to Dealer/Store/Subscription (see schema), so it's
-  // the single compensating action if a later step fails.
-  let user;
-  try {
-    user = await prisma.user.create({
-      data: {
-        email: parsed.data.email,
-        name: parsed.data.name,
-        passwordHash,
-        role: "DEALER",
-      },
-    });
-  } catch (err) {
-    console.error("[signupDealer] user.create failed:", err);
-    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+  // Four separate INSERTs rather than one nested write: PostgREST has no
+  // interactive transaction. Deleting the User cascades to Dealer, Store and
+  // Subscription, so it is the single compensating action if a later step
+  // fails.
+  const deleteUser = async (userId: string, stage: string) => {
+    const { error } = await db.from("User").delete().eq("id", userId);
+    if (error) {
+      console.error(`[signupDealer] cleanup after ${stage} also failed:`, error);
+    }
+  };
+
+  const userResult = await db
+    .from("User")
+    .insert({
+      email: parsed.data.email,
+      name: parsed.data.name,
+      passwordHash,
+      role: "DEALER",
+    })
+    .select("id")
+    .single();
+  if (userResult.error) {
+    console.error("[signupDealer] user insert failed:", userResult.error);
+    if (isUniqueViolation(userResult.error)) {
       return { ok: false, errors: { email: ["Email already in use"] } };
     }
-    throw err;
+    throw new Error(userResult.error.message);
+  }
+  const user = userResult.data;
+
+  const dealerResult = await db
+    .from("Dealer")
+    .insert({
+      userId: user.id,
+      businessName: parsed.data.businessName,
+      city: parsed.data.city,
+      phone: parsed.data.phone,
+      whatsapp: parsed.data.whatsapp,
+    })
+    .select("id")
+    .single();
+  if (dealerResult.error) {
+    console.error("[signupDealer] dealer insert failed:", dealerResult.error);
+    await deleteUser(user.id, "dealer insert failure");
+    throw new Error(dealerResult.error.message);
+  }
+  const dealer = dealerResult.data;
+
+  const subscriptionResult = await db.from("Subscription").insert({
+    dealerId: dealer.id,
+    plan: "FREE_TRIAL",
+    status: "TRIALING",
+    currentPeriodEnd: trialEnds.toISOString(),
+  });
+  if (subscriptionResult.error) {
+    console.error("[signupDealer] subscription insert failed:", subscriptionResult.error);
+    await deleteUser(user.id, "subscription insert failure");
+    throw new Error(subscriptionResult.error.message);
   }
 
-  let dealer;
-  try {
-    dealer = await prisma.dealer.create({
-      data: {
-        userId: user.id,
-        businessName: parsed.data.businessName,
-        city: parsed.data.city,
-        phone: parsed.data.phone,
-        whatsapp: parsed.data.whatsapp,
-      },
-    });
-  } catch (err) {
-    console.error("[signupDealer] dealer.create failed:", err);
-    await prisma.user.delete({ where: { id: user.id } }).catch((cleanupErr) => {
-      console.error("[signupDealer] cleanup after dealer.create failure also failed:", cleanupErr);
-    });
-    throw err;
-  }
-
-  try {
-    await prisma.subscription.create({
-      data: {
-        dealerId: dealer.id,
-        plan: "FREE_TRIAL",
-        status: "TRIALING",
-        currentPeriodEnd: trialEnds,
-      },
-    });
-  } catch (err) {
-    console.error("[signupDealer] subscription.create failed:", err);
-    await prisma.user.delete({ where: { id: user.id } }).catch((cleanupErr) => {
-      console.error(
-        "[signupDealer] cleanup after subscription.create failure also failed:",
-        cleanupErr,
-      );
-    });
-    throw err;
-  }
-
-  // Retry loop: handles slug uniqueness race condition (P2002 unique constraint violation).
-  // Crypto-random suffix avoids predictable retries that could collide again.
+  // Retry loop: handles the slug uniqueness race. `generateUniqueSlug` reads
+  // then writes, so two dealers registering the same business name at once
+  // can both pass the read. A crypto-random suffix keeps the retries from
+  // colliding on the same value again.
   const MAX_ATTEMPTS = 5;
   let created = false;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const suffix = attempt > 0 ? `-${randomBytes(3).toString("hex")}` : "";
     const slug = (await generateUniqueSlug(parsed.data.businessName)) + suffix;
 
-    try {
-      await prisma.store.create({ data: { dealerId: dealer.id, slug } });
+    const { error } = await db.from("Store").insert({ dealerId: dealer.id, slug });
+    if (!error) {
       created = true;
       break;
-    } catch (err) {
-      console.error(
-        `[signupDealer] store.create attempt ${attempt} failed (slug=${slug}):`,
-        err,
-      );
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-        continue;
-      }
-      throw err;
     }
+    console.error(
+      `[signupDealer] store insert attempt ${attempt} failed (slug=${slug}):`,
+      error,
+    );
+    if (isUniqueViolation(error)) continue;
+    await deleteUser(user.id, "store insert failure");
+    throw new Error(error.message);
   }
 
   if (!created) {
     // All retries collided. Surface as a form error rather than pretending success.
-    await prisma.user.delete({ where: { id: user.id } }).catch((cleanupErr) => {
-      console.error("[signupDealer] cleanup after slug exhaustion also failed:", cleanupErr);
-    });
+    await deleteUser(user.id, "slug exhaustion");
     return {
       ok: false,
       errors: {
@@ -304,6 +345,21 @@ export async function loginAction(
   // defeated by a botnet, an email-only bucket by spraying many accounts
   // from one host.
   const ip = getClientIpFromHeaders(await headers());
+
+  const captcha = await verifyTurnstile(formData.get(TURNSTILE_FIELD), {
+    remoteIp: ip,
+    expectedAction: TURNSTILE_ACTIONS.login,
+  });
+  if (!captcha.ok) {
+    logSecurityEvent({
+      type: "auth.login.failure",
+      outcome: "deny",
+      action: "login",
+      reason: "captcha_failed",
+    });
+    return { ok: false, error: "Verification failed. Please refresh and try again." };
+  }
+
   const emailKey = parsed.data.email.trim().toLowerCase();
   const [ipLimit, accountLimit] = await Promise.all([
     rateLimit(`login:ip:${ip}`, 10, 15 * 60 * 1000),
@@ -343,10 +399,10 @@ export async function loginAction(
     return { ok: false, error: "Invalid email or password." };
   }
 
-  const user = await prisma.user.findUnique({
-    where: { email: parsed.data.email },
-    select: { id: true, role: true },
-  });
+  const user = unwrapMaybe(
+    await db.from("User").select("id, role").eq("email", parsed.data.email).maybeSingle(),
+    "loginAction: post-signin lookup",
+  );
   logSecurityEvent({
     type: "auth.login.success",
     outcome: "allow",

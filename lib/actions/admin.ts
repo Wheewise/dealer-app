@@ -1,7 +1,15 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { prisma } from "@/lib/db";
+import {
+  count,
+  db,
+  embeddedCount,
+  unwrap,
+  unwrapMaybe,
+  withFilters,
+  type FilterChain,
+} from "@/lib/db";
 import {
   AuthorizationError,
   logSecurityEvent,
@@ -23,10 +31,20 @@ export async function getAdminStats() {
   await requireAdmin("read");
 
   const [dealerCount, listingCount, leadCount, activeSubs] = await Promise.all([
-    prisma.dealer.count(),
-    prisma.listing.count({ where: { status: "ACTIVE" } }),
-    prisma.enquiry.count(),
-    prisma.subscription.count({ where: { status: "ACTIVE" } }),
+    count(db.from("Dealer").select("id", { count: "exact", head: true })),
+    count(
+      db
+        .from("Listing")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "ACTIVE"),
+    ),
+    count(db.from("Enquiry").select("id", { count: "exact", head: true })),
+    count(
+      db
+        .from("Subscription")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "ACTIVE"),
+    ),
   ]);
 
   return { dealerCount, listingCount, leadCount, activeSubs };
@@ -35,15 +53,29 @@ export async function getAdminStats() {
 export async function getDealers() {
   await requireAdmin("manage_dealers");
 
-  return prisma.dealer.findMany({
-    include: {
-      user: { select: { email: true } },
-      store: { select: { slug: true } },
-      subscription: { select: { plan: true, status: true } },
-      _count: { select: { listings: true, enquiries: true } },
+  const rows = unwrap(
+    await db
+      .from("Dealer")
+      .select(
+        `*,
+         user:User(email),
+         store:Store(slug),
+         subscription:Subscription(plan, status),
+         listings:Listing(count),
+         enquiries:Enquiry(count)`,
+      )
+      .order("createdAt", { ascending: false }),
+    "getDealers",
+  );
+
+  // `_count` is kept as the shape the admin pages already render.
+  return rows.map((d) => ({
+    ...d,
+    _count: {
+      listings: embeddedCount(d.listings),
+      enquiries: embeddedCount(d.enquiries),
     },
-    orderBy: { createdAt: "desc" },
-  });
+  }));
 }
 
 export async function getBuyers({
@@ -57,32 +89,41 @@ export async function getBuyers({
 }) {
   await requireAdmin("manage_users");
 
-  const where = q
-    ? {
-        role: "BUYER" as const,
-        OR: [
-          { name: { contains: q, mode: "insensitive" as const } },
-          { email: { contains: q, mode: "insensitive" as const } },
-        ],
-      }
-    : { role: "BUYER" as const };
+  // `q` reaches PostgREST inside an `or=` list, where a comma or parenthesis
+  // would otherwise terminate the value and change which columns are matched.
+  const term = q ? `"${q.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : null;
 
-  const [total, buyers] = await Promise.all([
-    prisma.user.count({ where }),
-    prisma.user.findMany({
-      where,
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        createdAt: true,
-        _count: { select: { enquiries: true, savedListings: true } },
-      },
-      orderBy: { createdAt: "desc" },
-      skip: (page - 1) * pageSize,
-      take: pageSize,
-    }),
+  const predicate = (query: FilterChain): FilterChain => {
+    const scoped = query.eq("role", "BUYER");
+    return term ? scoped.or(`name.ilike.%${term}%,email.ilike.%${term}%`) : scoped;
+  };
+
+  const from = (page - 1) * pageSize;
+
+  const [total, rows] = await Promise.all([
+    count(
+      withFilters(db.from("User").select("id", { count: "exact", head: true }), predicate),
+    ),
+    withFilters(
+      db
+        .from("User")
+        .select(
+          "id, name, email, createdAt, enquiries:Enquiry(count), savedListings:SavedListing(count)",
+        ),
+      predicate,
+    )
+      .order("createdAt", { ascending: false })
+      .range(from, from + pageSize - 1)
+      .then((r) => unwrap(r, "getBuyers")),
   ]);
+
+  const buyers = rows.map((b) => ({
+    ...b,
+    _count: {
+      enquiries: embeddedCount(b.enquiries),
+      savedListings: embeddedCount(b.savedListings),
+    },
+  }));
 
   return {
     buyers,
@@ -95,55 +136,71 @@ export async function getBuyers({
 export async function getDealerSubscriptions() {
   await requireAdmin("manage_dealers");
 
-  return prisma.dealer.findMany({
-    select: {
-      id: true,
-      businessName: true,
-      city: true,
-      store: { select: { slug: true } },
-      subscription: {
-        select: { plan: true, status: true, currentPeriodEnd: true },
-      },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  const rows = unwrap(
+    await db
+      .from("Dealer")
+      .select(
+        `id, businessName, city,
+         store:Store(slug),
+         subscription:Subscription(plan, status, currentPeriodEnd)`,
+      )
+      .order("createdAt", { ascending: false }),
+    "getDealerSubscriptions",
+  );
+
+  return rows;
 }
 
 export async function getPendingModeration() {
   await requireAdmin("manage_configuration");
 
-  return prisma.listing.findMany({
-    where: { status: "ACTIVE" },
-    include: {
-      dealer: { select: { businessName: true } },
-      photos: { take: 1, orderBy: { sortOrder: "asc" } },
-    },
-    orderBy: { createdAt: "desc" },
-    take: 50,
-  });
+  const rows = unwrap(
+    await db
+      .from("Listing")
+      .select("*, dealer:Dealer(businessName), photos:ListingPhoto(id, url, sortOrder)")
+      .eq("status", "ACTIVE")
+      .order("createdAt", { ascending: false })
+      .limit(50),
+    "getPendingModeration",
+  );
+
+  // PostgREST cannot order or limit an embed per parent row, so the "first
+  // photo" narrowing happens here.
+  return rows.map((l) => ({
+    ...l,
+    photos: [...l.photos].sort((a, b) => a.sortOrder - b.sortOrder).slice(0, 1),
+  }));
 }
 
 export async function suspendDealer(dealerId: string) {
   const ctx = await requireAdmin("manage_dealers");
 
-  const dealer = await prisma.dealer.findUnique({
-    where: { id: dealerId },
-    select: { id: true, status: true },
-  });
+  const dealer = unwrapMaybe(
+    await db.from("Dealer").select("id, status").eq("id", dealerId).maybeSingle(),
+    "suspendDealer lookup",
+  );
   if (!dealer) return;
 
   const newStatus = dealer.status === "SUSPENDED" ? "ACTIVE" : "SUSPENDED";
 
-  await prisma.dealer.update({
-    where: { id: dealerId },
-    data: { status: newStatus },
-  });
+  unwrap(
+    await db.from("Dealer").update({ status: newStatus }).eq("id", dealerId).select("id"),
+    "suspendDealer",
+  );
 
+  // Pausing live inventory is what makes suspension visible to buyers. The
+  // dealer cannot undo it: `guard_dealer_status_change` refuses a status
+  // write from a non-privileged session.
   if (newStatus === "SUSPENDED") {
-    await prisma.listing.updateMany({
-      where: { dealerId, status: "ACTIVE" },
-      data: { status: "PAUSED" },
-    });
+    unwrap(
+      await db
+        .from("Listing")
+        .update({ status: "PAUSED" })
+        .eq("dealerId", dealerId)
+        .eq("status", "ACTIVE")
+        .select("id"),
+      "suspendDealer: pause listings",
+    );
   }
 
   logSecurityEvent({
@@ -161,10 +218,10 @@ export async function suspendDealer(dealerId: string) {
 export async function removeListingByAdmin(listingId: string) {
   const ctx = await requireAdmin("delete");
 
-  await prisma.listing.update({
-    where: { id: listingId },
-    data: { status: "PAUSED" },
-  });
+  unwrap(
+    await db.from("Listing").update({ status: "PAUSED" }).eq("id", listingId).select("id"),
+    "removeListingByAdmin",
+  );
 
   logSecurityEvent({
     type: "admin.action",
@@ -183,12 +240,15 @@ export async function removeListingByAdmin(listingId: string) {
 export async function getPayouts() {
   await requireAdmin("manage_configuration");
 
-  return prisma.payout.findMany({
-    include: {
-      dealer: { select: { businessName: true, phone: true } },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+  const rows = unwrap(
+    await db
+      .from("Payout")
+      .select("*, dealer:Dealer(businessName, phone)")
+      .order("createdAt", { ascending: false }),
+    "getPayouts",
+  );
+
+  return rows;
 }
 
 export async function updatePayoutStatus(
@@ -197,10 +257,10 @@ export async function updatePayoutStatus(
 ) {
   const ctx = await requireAdmin("approve");
 
-  await prisma.payout.update({
-    where: { id: payoutId },
-    data: { status },
-  });
+  unwrap(
+    await db.from("Payout").update({ status }).eq("id", payoutId).select("id"),
+    "updatePayoutStatus",
+  );
 
   logSecurityEvent({
     type: "admin.action",
@@ -225,8 +285,12 @@ export async function getDealerPayouts(dealerId: string) {
     throw new AuthorizationError();
   }
 
-  return prisma.payout.findMany({
-    where: { dealerId },
-    orderBy: { createdAt: "desc" },
-  });
+  return unwrap(
+    await db
+      .from("Payout")
+      .select("*")
+      .eq("dealerId", dealerId)
+      .order("createdAt", { ascending: false }),
+    "getDealerPayouts",
+  );
 }

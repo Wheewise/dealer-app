@@ -20,16 +20,16 @@ Repository**.
 |---|---|
 | Framework preset | Next.js (auto-detected) |
 | Root directory | `./` — the repo root *is* the app |
-| Build command | leave as-is; `vercel.json` sets `npx prisma generate && next build` |
+| Build command | leave as-is; `vercel.json` sets `next build` |
 | Install command | `npm install` (from `vercel.json`) |
 | Node version | 22.x — `package.json` requires `>=22` |
 
-`npx prisma generate` must stay in the build command. Vercel caches
-`node_modules`, and a cached install skips Prisma's postinstall, which leaves
-the generated client stale.
+There is no code-generation step: the database types in `types/supabase.ts` are
+committed, so a cached `node_modules` cannot leave anything stale.
 
-Do **not** deploy before setting the environment variables below — the first
-build will succeed but the running app will fail to authenticate.
+Apply `supabase/schema.sql` to the Supabase project first. Do **not** deploy
+before setting the environment variables below — the first build will succeed
+but the running app will fail on its first query.
 
 ---
 
@@ -41,13 +41,17 @@ Set these for **Production**, **Preview** and **Development** unless noted.
 
 | Variable | Value | Notes |
 |---|---|---|
-| `DATABASE_URL` | your Neon pooled connection string | Identical in all three |
+| `NEXT_PUBLIC_SUPABASE_URL` | `https://<project-ref>.supabase.co` | Identical in all three |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase → Settings → API | Public by design; safe in the browser bundle |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase → Settings → API | **Server only.** Bypasses RLS — never prefix it `NEXT_PUBLIC_`, and rotate it if it ever reaches a client bundle |
 | `AUTH_SECRET` | `openssl rand -base64 32` | **Generate once, paste the same value into all three.** Different values mean each app rejects the others' sessions |
 | `AUTH_TRUST_HOST` | `true` | Required behind Vercel's proxy |
 | `AUTH_COOKIE_DOMAIN` | `.wheewise.com` | Leading dot. Scopes the session cookie to the parent domain so one sign-in covers all three subdomains |
 | `NEXT_PUBLIC_USER_APP_URL` | `https://wheewise.com` | |
 | `NEXT_PUBLIC_DEALER_APP_URL` | `https://dealer.wheewise.com` | |
 | `NEXT_PUBLIC_ADMIN_APP_URL` | `https://admin.wheewise.com` | |
+| `UPSTASH_REDIS_REST_URL` | from console.upstash.com | Shared store for rate limits + OTPs — see §5 |
+| `UPSTASH_REDIS_REST_TOKEN` | from console.upstash.com | Same database for all three apps |
 
 ### 2.2 Per-project
 
@@ -65,7 +69,8 @@ the corresponding endpoint exists.
 |---|:--:|:--:|:--:|---|
 | `RESEND_API_KEY`, `RESEND_FROM` | ✅ | — | — | lead notification emails from `/api/leads` |
 | `MSG91_AUTH_KEY` *(or `TWILIO_*`)* | ✅ | ○ | ○ | `/api/auth/send-otp`; required wherever phone login is offered |
-| `BLOB_READ_WRITE_TOKEN` | — | ✅ | — | `/api/uploads` (vehicle photos) |
+| `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_BASE_URL` | — | ✅ | — | `/api/uploads` — photos go to Cloudflare R2, served from its CDN (§7) |
+| `BLOB_READ_WRITE_TOKEN` | — | ○ | — | deprecated Vercel Blob fallback; unused once R2 is set |
 | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | — | ✅ | — | subscriptions, boosts |
 | `RAZORPAY_WEBHOOK_SECRET` | — | ✅ | — | `/api/billing/webhook`, `/api/webhooks/razorpay` |
 | `RAZORPAY_PLAN_MONTHLY`, `RAZORPAY_PLAN_YEARLY` | — | ✅ | — | checkout |
@@ -73,7 +78,8 @@ the corresponding endpoint exists.
 | `SUREPASS_TOKEN` *(or `RTO_PROVIDER_TOKEN`)* | — | ✅ | — | `/api/rto` |
 | `GST_PROVIDER_TOKEN` | — | ✅ | — | `/api/gst/verify` |
 | `OPENAI_API_KEY` *or* `ANTHROPIC_API_KEY` | — | ✅ | — | `/api/ai/generate-description` |
-| `UPLOAD_HOST_ALLOWLIST` | — | ✅ | — | pins stored image URLs to hosts you control |
+| `UPLOAD_HOST_ALLOWLIST` | — | ✅ | — | pins stored image URLs to hosts you control — set to your R2 public host |
+| `TURNSTILE_SECRET_KEY`, `NEXT_PUBLIC_TURNSTILE_SITE_KEY` | ✅ | ✅ | ✅ | bot protection on enquiry / OTP / login / signup (§8) |
 | `SENTRY_DSN` | ○ | ○ | ○ | optional, all three |
 
 ✅ required · ○ optional · — not used
@@ -120,19 +126,110 @@ secret configured in the Razorpay dashboard.
 
 ---
 
-## 5. Known caveat: rate limiting on Vercel
+## 5. Upstash Redis (required)
 
-`lib/rate-limit.ts` falls back to an **in-process** bucket when no KV store is
-registered. On Vercel's serverless runtime each cold start gets a fresh
-process, so login throttling, OTP caps and lead-form limits are substantially
-weaker than they look. The module logs a warning once per process in
-production.
+Rate limiting and phone OTPs both need a store shared across instances.
+Without one they fall back to per-process memory, and on Vercel that means:
 
-The existing `setRateLimitKv()` hook takes any store with `get`/`put`, so
-wiring Vercel KV or Upstash Redis to it is a small change — but it is a change,
-because the current implementation was written against a Cloudflare KV binding.
-Until then, treat the brute-force protection added in the security review as
-partial. This is risk **R-02** in `docs/security/SECURITY_REPORT.md`.
+- login/OTP/lead throttles reset on every cold start — effectively no limiting;
+- **phone login breaks entirely**, because the instance that issues a code is
+  usually not the one that verifies it.
+
+Create one Upstash Redis database (console.upstash.com) and set the same two
+variables in **all three** projects:
+
+```
+UPSTASH_REDIS_REST_URL
+UPSTASH_REDIS_REST_TOKEN
+```
+
+Pick a region close to your Vercel region — every throttled request costs one
+round trip. One database serves all three apps; keys are namespaced (`rl:` for
+rate limits, `otp:` for codes).
+
+The client talks to Upstash over its REST API, so it works unchanged on Node,
+Edge and Workers, and adds no dependency. Counting uses `INCR`, which is
+atomic — the previous read-then-write design let concurrent requests overshoot
+the limit, which is exactly the case a credential-stuffing attempt produces.
+
+Behaviour if Upstash is unreachable:
+
+| Path | Behaviour |
+|---|---|
+| Rate limiting | Degrades to per-instance buckets and logs `[upstash] Rate limiting fell back…` once per process. Chosen so a Redis outage cannot lock everyone out of signing in — **alert on that log line.** |
+| OTP verification | Fails closed — an unavailable store must not become a way past the check. |
+| OTP issuing | Raises, rather than sending an SMS carrying a code that could never be verified. |
+
+## 7. Cloudflare R2 for photos
+
+Listing photos are stored in R2 and served from its public hostname, so image
+delivery runs on Cloudflare's CDN and never touches the app.
+
+Setup, once:
+
+1. Create an R2 bucket (e.g. `wheewise-photos`).
+2. Give it a public hostname. A **custom domain** (`cdn.wheewise.com`) is
+   preferable to the `pub-*.r2.dev` development URL — the latter is
+   rate-limited and not meant for production traffic.
+3. Mint an R2 API token with **Object Read & Write** scoped to that bucket.
+4. Set `R2_*` on the **dealer** project only — it is the only app that ships
+   `/api/uploads`.
+5. Set `UPLOAD_HOST_ALLOWLIST` to the same public host, so stored image URLs
+   are pinned to a host you control.
+
+> The bucket must be publicly readable. R2 ignores per-object ACLs, so a
+> private bucket accepts every upload and then 404s every read. Verify by
+> opening one uploaded URL in a browser before going live.
+
+Uploads are validated by **magic bytes**, not by the declared MIME type — a
+client can claim `image/png` while sending anything. Only real JPEG, PNG and
+WebP are accepted, and the stored object's extension comes from the sniffed
+type rather than the supplied filename.
+
+### Existing photos
+
+Images already on Vercel Blob keep working: the database stores absolute URLs,
+which are unaffected by the switch. Only new uploads go to R2. To move the old
+objects, copy them into the bucket preserving their paths and rewrite the
+`ListingPhoto.url` / `Listing360Photo.url` / `Store.logoUrl` /
+`Store.bannerUrl` prefixes — do it as a one-off script, and keep the Blob store
+alive until the rewrite is verified.
+
+---
+
+## 8. Cloudflare Turnstile
+
+Turnstile guards the endpoints that are unauthenticated, expensive, or both:
+
+| Form | Endpoint | Why |
+|---|---|---|
+| Storefront enquiry | `POST /api/leads` | unauthenticated; each accepted lead sends an email and an SMS |
+| Phone login | `POST /api/auth/send-otp` | every request costs a paid SMS |
+| Sign in | `loginAction` | credential stuffing |
+| Sign up (buyer, dealer) | `signupBuyer` / `signupDealer` | fake-account creation |
+
+Create a widget at **dash.cloudflare.com → Turnstile**, add all three
+hostnames to it, then set both keys on **all three** projects. The site key is
+public (`NEXT_PUBLIC_`); the secret key is server-only.
+
+Notes that matter:
+
+- **Unset keys mean no protection, silently.** The forms keep working and
+  verification is skipped — deliberate, so local development needs no
+  Cloudflare account, but it means a missing production variable is invisible.
+  The server logs a warning at boot; watch for it.
+- Verification **fails closed**. If Cloudflare is unreachable or times out,
+  the request is refused rather than waved through — the opposite of the
+  rate-limit fallback, because here refusing traffic is the entire point.
+- Each form sends a distinct `action`, and the server checks it. Without that,
+  a token minted on the cheap public enquiry form could be replayed against
+  the SMS endpoint.
+- The CSP in `middleware.ts` already allows `challenges.cloudflare.com` in
+  `script-src`, `connect-src` and `frame-src`. Turnstile renders in an iframe,
+  so all three are required.
+- Supabase Auth has its own built-in Turnstile setting (Authentication →
+  Attack Protection). Enable it after the stage-3 auth cutover so the hosted
+  auth endpoints are covered too; the same site key works.
 
 ---
 

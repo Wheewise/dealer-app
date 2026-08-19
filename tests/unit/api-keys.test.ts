@@ -1,14 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-vi.mock("../../lib/db", () => ({
-  prisma: {
-    apiKey: {
-      findUnique: vi.fn(),
-      findFirst: vi.fn(),
-      update: vi.fn(),
-    },
-  },
-}));
+vi.mock("../../lib/db", async () => {
+  const { makeDbModule } = await import("../helpers/supabase-mock");
+  return makeDbModule();
+});
 
 import {
   hashApiKey,
@@ -16,20 +11,26 @@ import {
   generateApiKey,
   validateApiKey,
 } from "../../lib/api-auth";
-import { prisma } from "../../lib/db";
+import * as dbModule from "../../lib/db";
+import type { DbMock } from "../helpers/supabase-mock";
 
-type Mock = ReturnType<typeof vi.fn>;
-const findUnique = prisma.apiKey.findUnique as unknown as Mock;
-const findFirst = prisma.apiKey.findFirst as unknown as Mock;
-const update = prisma.apiKey.update as unknown as Mock;
+const dbMock = (dbModule as unknown as { __mock: DbMock }).__mock;
 
 beforeEach(() => {
-  vi.clearAllMocks();
-  update.mockResolvedValue({});
+  dbMock.reset();
 });
 
 function req(headers: Record<string, string>): Request {
   return new Request("http://test/", { headers });
+}
+
+/** The ApiKey reads, in order: hash lookup first, legacy plaintext second. */
+function selects() {
+  return dbMock.calls.filter((c) => c.table === "ApiKey" && c.operation === "select");
+}
+
+function updates() {
+  return dbMock.calls.filter((c) => c.table === "ApiKey" && c.operation === "update");
 }
 
 describe("api-key primitives", () => {
@@ -60,60 +61,66 @@ describe("api-key primitives", () => {
 describe("validateApiKey", () => {
   it("returns null when no header is present", async () => {
     expect(await validateApiKey(req({}))).toBeNull();
-    expect(findUnique).not.toHaveBeenCalled();
+    expect(dbMock.calls).toHaveLength(0);
   });
 
   it("looks up by SHA-256 hash on the modern path", async () => {
     const plaintext = "wk_test_plaintext_key";
-    findUnique.mockResolvedValue({ id: "k1", dealerId: "d1" });
+    dbMock.queue({ data: { id: "k1", dealerId: "d1" } });
 
     const dealerId = await validateApiKey(req({ authorization: `Bearer ${plaintext}` }));
 
     expect(dealerId).toBe("d1");
-    expect(findUnique).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { keyHash: hashApiKey(plaintext) },
-      }),
-    );
-    // legacy fallback should NOT have been queried
-    expect(findFirst).not.toHaveBeenCalled();
+    expect(selects()[0].filters).toContainEqual({
+      method: "eq",
+      args: ["keyHash", hashApiKey(plaintext)],
+    });
+    // The legacy fallback must not have been queried.
+    expect(selects()).toHaveLength(1);
   });
 
   it("accepts X-API-Key header as fallback", async () => {
-    findUnique.mockResolvedValue({ id: "k2", dealerId: "d2" });
+    dbMock.queue({ data: { id: "k2", dealerId: "d2" } });
     const dealerId = await validateApiKey(req({ "x-api-key": "wk_xxx" }));
     expect(dealerId).toBe("d2");
   });
 
+  it("never selects the secret columns back out", async () => {
+    dbMock.queue({ data: { id: "k1", dealerId: "d1" } });
+    await validateApiKey(req({ authorization: "Bearer wk_x" }));
+    expect(selects()[0].select).toBe("id, dealerId");
+  });
+
   it("falls back to legacy plaintext column and backfills the hash", async () => {
     const plaintext = "wk_legacy_key";
-    findUnique.mockResolvedValue(null);
-    findFirst.mockResolvedValue({ id: "k3", dealerId: "d3" });
+    dbMock.queue({ data: null }); // hash lookup misses
+    dbMock.queue({ data: { id: "k3", dealerId: "d3" } }); // legacy hit
 
     const dealerId = await validateApiKey(req({ authorization: `Bearer ${plaintext}` }));
 
     expect(dealerId).toBe("d3");
-    expect(findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { key: plaintext, keyHash: null },
-      }),
+    expect(selects()[1].filters).toEqual(
+      expect.arrayContaining([
+        { method: "eq", args: ["key", plaintext] },
+        { method: "is", args: ["keyHash", null] },
+      ]),
     );
-    // wait one microtask so the fire-and-forget backfill has dispatched
+
+    // Wait one turn so the fire-and-forget backfill has dispatched.
     await new Promise((r) => setTimeout(r, 0));
-    expect(update).toHaveBeenCalledWith(
+    const backfill = updates()[0];
+    expect(backfill.payload).toEqual(
       expect.objectContaining({
-        where: { id: "k3" },
-        data: expect.objectContaining({
-          keyHash: hashApiKey(plaintext),
-          keyPrefix: keyPrefixOf(plaintext),
-        }),
+        keyHash: hashApiKey(plaintext),
+        keyPrefix: keyPrefixOf(plaintext),
       }),
     );
+    expect(backfill.filters).toContainEqual({ method: "eq", args: ["id", "k3"] });
   });
 
   it("returns null when neither hash nor legacy lookup matches", async () => {
-    findUnique.mockResolvedValue(null);
-    findFirst.mockResolvedValue(null);
+    dbMock.queue({ data: null });
+    dbMock.queue({ data: null });
     expect(await validateApiKey(req({ authorization: "Bearer wrong" }))).toBeNull();
   });
 
