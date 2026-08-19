@@ -1,0 +1,9 @@
+.next
+.open-next
+.wrangler
+node_modules
+build
+coverage
+out
+package-lock.json
+next-env.d.ts

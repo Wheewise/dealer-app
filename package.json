@@ -1,0 +1,88 @@
+{
+  "name": "dealer-app",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install --with-deps chromium",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio",
+    "db:seed": "node --import tsx prisma/seed.ts",
+    "cf:build": "opennextjs-cloudflare build",
+    "cf:preview": "opennextjs-cloudflare build && wrangler dev",
+    "cf:deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy"
+  },
+  "dependencies": {
+    "@auth/prisma-adapter": "^2.11.2",
+    "@neondatabase/serverless": "^1.1.0",
+    "@opennextjs/cloudflare": "^1.19.8",
+    "@prisma/adapter-neon": "^6.19.3",
+    "@prisma/client": "^6.19.3",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@vercel/blob": "^2.6.1",
+    "bcryptjs": "^3.0.3",
+    "next": "^16.2.10",
+    "next-auth": "^5.0.0-beta.31",
+    "prisma": "^6.19.3",
+    "razorpay": "^2.9.6",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "react-is": "^16.13.1",
+    "recharts": "^3.9.0",
+    "resend": "^6.12.3",
+    "tailwindcss": "^4.3.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@sentry/nextjs": "^10.52.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^6.0.1",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.5",
+    "jsdom": "^29.1.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5",
+    "vitest": "^4.1.5",
+    "wrangler": "^4.112.0"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx,mjs}": [
+      "prettier --write",
+      "eslint --fix"
+    ],
+    "*.{json,css,md}": [
+      "prettier --write"
+    ]
+  },
+  "allowScripts": {
+    "esbuild@0.25.4": true,
+    "esbuild@0.27.7": true,
+    "esbuild@0.28.1": true,
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "@sentry/cli@2.58.5": true,
+    "prisma@6.19.3": true,
+    "sharp@0.34.5": true,
+    "unrs-resolver@1.11.1": true,
+    "workerd@1.20260714.1": true
+  },
+  "description": "Dealer console — inventory, leads, test drives, billing, storefront."
+}

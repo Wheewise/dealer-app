@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-red: #dc2626;
+  --color-brand-red-dark: #b91c1c;
+  --color-brand-red-soft: #ef4444;
+  --color-brand-ink: #0a0a0a;
+  --color-brand-charcoal: #1a1a1a;
+  --color-brand-graphite: #27272a;
+  --color-brand-mist: #71717a;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+:root {
+  --background: #ffffff;
+  --foreground: #0a0a0a;
+  --surface-muted: #f4f4f5;
+  --border-default: #e4e4e7;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #fafafa;
+    --surface-muted: #18181b;
+    --border-default: #27272a;
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface-muted: var(--surface-muted);
+  --color-border-default: var(--border-default);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ─── Brand intro keyframes ─────────────────────────────────────────────── */
+
+@keyframes ww-glow-emerge {
+  0%   { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes ww-streak-in {
+  0%   { opacity: 0; transform: scaleX(0); }
+  35%  { opacity: 0.6; transform: scaleX(1); }
+  100% { opacity: 0; transform: scaleX(1); }
+}
+
+@keyframes ww-particle-drift {
+  0%   { opacity: 0; transform: translate(0, 0); }
+  18%  { opacity: 0.75; }
+  78%  { opacity: 0.2; }
+  100% { opacity: 0; transform: translate(-14px, -80px); }
+}
+
+@keyframes ww-logo-appear {
+  0%   { opacity: 0; transform: scale(0.84); filter: blur(6px); }
+  60%  { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; transform: scale(1); filter: blur(0); }
+}
+
+@keyframes ww-brand-text {
+  0%   { opacity: 0; letter-spacing: 0.42em; }
+  100% { opacity: 1; letter-spacing: 0.2em; }
+}
+
+@keyframes ww-fade-up {
+  0%   { opacity: 0; transform: translateY(14px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes ww-intro-exit {
+  0%   { opacity: 1; }
+  100% { opacity: 0; pointer-events: none; }
+}
