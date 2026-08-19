@@ -3,15 +3,20 @@ import "./env";
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
+import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { db, unwrap, unwrapMaybe } from "./db";
 import { verifyOtp } from "./otp";
+
+const APP_ROLE = "DEALER";
 
 const credentialsSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8),
   dev: z.coerce.boolean().optional(),
 });
+
+const supabaseTokenSchema = z.object({ supabaseAccessToken: z.string().min(20) });
 
 const otpSchema = z.object({
   phone: z.string().min(10).max(15),
@@ -46,7 +51,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   // unset variable leaves stock single-host behaviour intact for local dev.
   cookies: {
     sessionToken: {
-      options: { domain: process.env.AUTH_COOKIE_DOMAIN || undefined },
+      name: "wheewise-dealer.session-token",
+      options: {},
     },
   },
   providers: [
@@ -57,8 +63,32 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         phone: { label: "Phone", type: "tel" },
         otp: { label: "OTP", type: "text" },
         dev: { label: "Dev", type: "checkbox" },
+        supabaseAccessToken: { label: "Supabase access token", type: "text" },
       },
       async authorize(creds) {
+        // Dealer portal access starts with a Supabase email OTP. `getUser`
+        // validates the token against Supabase rather than trusting browser data.
+        if (creds.supabaseAccessToken) {
+          const parsed = supabaseTokenSchema.safeParse(creds);
+          if (!parsed.success) return null;
+          const url = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
+          const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+          if (!url || !anon) return null;
+          const supabase = createClient(url, anon, { auth: { persistSession: false } });
+          const { data, error } = await supabase.auth.getUser(parsed.data.supabaseAccessToken);
+          const email = data.user?.email?.toLowerCase();
+          if (error || !email) return null;
+          const user = unwrapMaybe(
+            await db.from("User").select("id, email, name, role").eq("email", email).maybeSingle(),
+            "auth: Supabase dealer lookup",
+          );
+          if (!user || user.role !== APP_ROLE) return null;
+          return { id: user.id, email: user.email, name: user.name, role: user.role };
+        }
+
+        // This portal deliberately has no password or legacy-SMS fallback.
+        if (!creds.supabaseAccessToken) return null;
+
         // Phone OTP flow
         if (creds.phone && creds.otp) {
           const parsed = otpSchema.safeParse(creds);
@@ -77,6 +107,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             "auth: lookup by phone",
           );
 
+          if (existing?.role !== APP_ROLE) return null;
+
           if (existing) {
             return {
               id: existing.id,
@@ -86,29 +118,9 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             };
           }
 
-          // Auto-create buyer account for new phone numbers (no email for phone-only users)
-          const user = unwrap(
-            await db
-              .from("User")
-              .insert({
-                email: null,
-                phone: normalized,
-                passwordHash: "",
-                name: `User ${normalized.slice(-4)}`,
-                role: "BUYER",
-              })
-              .select("id, email, name, role")
-              .single(),
-            "auth: create phone user",
-          );
-
-          return {
-            id: user.id,
-            // NextAuth requires a non-null email; use phone as synthetic identifier
-            email: user.email ?? `${normalized}@wheewise.phone`,
-            name: user.name,
-            role: user.role,
-          };
+          // Dealer accounts are provisioned through registration, never from
+          // a portal login attempt.
+          return null;
         }
 
         // Dev fast-login — requires BOTH WHEEWISE_DEV_LOGIN=1 AND NODE_ENV=development.
@@ -173,6 +185,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             );
           }
 
+          if (user.role !== APP_ROLE) return null;
+
           return {
             id: user.id,
             email: user.email,
@@ -193,7 +207,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
             .maybeSingle(),
           "auth: lookup by email",
         );
-        if (!user || !user.passwordHash) return null;
+        if (!user || !user.passwordHash || user.role !== APP_ROLE) return null;
 
         const ok = await bcrypt.compare(parsed.data.password, user.passwordHash);
         if (!ok) return null;

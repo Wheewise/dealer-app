@@ -1,91 +1,98 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import { signIn } from "next-auth/react";
-import { useRouter } from "next/navigation";
-import { LoginForm } from "./LoginForm";
-import { OtpLoginForm } from "./OtpLoginForm";
-
-const isDev = process.env.NODE_ENV !== "production";
+import { useRouter, useSearchParams } from "next/navigation";
+import { supabaseBrowser } from "@/lib/supabase-browser";
+import { Button, Field, Input } from "@/components/ui/Field";
 
 export function LoginTabs() {
-  const [tab, setTab] = useState<"email" | "otp">("email");
-  const [devLoading, setDevLoading] = useState(false);
-  const [devError, setDevError] = useState("");
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [sent, setSent] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
 
-  const devSignIn = useCallback(async () => {
-    setDevLoading(true);
-    setDevError("");
-    try {
-      const result = await signIn("credentials", {
-        email: "dev@wheewise.local",
-        password: "ignored",
-        dev: true,
-        redirect: false,
-      });
-      if (result?.error) {
-        setDevError(result.error);
-      } else {
-        router.push("/dashboard");
-        router.refresh();
-      }
-    } catch {
-      setDevError("Dev sign-in failed");
-    } finally {
-      setDevLoading(false);
+  async function sendCode() {
+    setPending(true);
+    setError("");
+    const { error: otpError } = await supabaseBrowser.auth.signInWithOtp({
+      email,
+      options: { shouldCreateUser: true },
+    });
+    setPending(false);
+    if (otpError) return setError(otpError.message);
+    setSent(true);
+  }
+
+  async function verifyCode() {
+    setPending(true);
+    setError("");
+    const { data, error: verifyError } = await supabaseBrowser.auth.verifyOtp({
+      email,
+      token: code,
+      type: "email",
+    });
+    if (verifyError || !data.session) {
+      setPending(false);
+      return setError(verifyError?.message ?? "The verification code is invalid or expired.");
     }
-  }, [router]);
+    const result = await signIn("credentials", {
+      supabaseAccessToken: data.session.access_token,
+      redirect: false,
+    });
+    setPending(false);
+    if (result?.error) return setError("This email is not authorised for the dealer portal.");
+    router.push(searchParams.get("callbackUrl") || "/dashboard");
+    router.refresh();
+  }
 
   return (
-    <div>
-      <div className="mb-6 flex border-b">
-        <button
-          type="button"
-          onClick={() => setTab("email")}
-          className={`flex-1 pb-3 text-sm font-medium transition-colors ${
-            tab === "email"
-              ? "text-brand-red border-brand-red border-b-2"
-              : "border-b-2 border-transparent text-zinc-500 hover:text-zinc-700"
-          }`}
-        >
-          Email & Password
+    <div className="space-y-4">
+      <p className="rounded-md bg-zinc-50 px-3 py-2 text-sm text-zinc-600">
+        We will send a one-time sign-in code to your dealership email.
+      </p>
+      <Field label="Dealership email" name="email">
+        <Input
+          id="email"
+          name="email"
+          type="email"
+          autoComplete="email"
+          value={email}
+          onChange={(event) => setEmail(event.target.value)}
+          disabled={sent}
+          required
+        />
+      </Field>
+      {sent ? (
+        <Field label="Email verification code" name="code">
+          <Input
+            id="code"
+            name="code"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            maxLength={6}
+            value={code}
+            onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+            required
+          />
+        </Field>
+      ) : null}
+      {error ? <p className="bg-brand-red/10 text-brand-red rounded-md px-3 py-2 text-sm">{error}</p> : null}
+      <Button
+        type="button"
+        className="w-full"
+        disabled={pending || !email || (sent && code.length !== 6)}
+        onClick={sent ? verifyCode : sendCode}
+      >
+        {pending ? "Please wait…" : sent ? "Verify and sign in" : "Email me a code"}
+      </Button>
+      {sent ? (
+        <button type="button" className="w-full text-sm text-zinc-500 hover:underline" onClick={() => setSent(false)}>
+          Use a different email
         </button>
-        <button
-          type="button"
-          onClick={() => setTab("otp")}
-          className={`flex-1 pb-3 text-sm font-medium transition-colors ${
-            tab === "otp"
-              ? "text-brand-red border-brand-red border-b-2"
-              : "border-b-2 border-transparent text-zinc-500 hover:text-zinc-700"
-          }`}
-        >
-          Phone OTP
-        </button>
-      </div>
-      {tab === "email" ? <LoginForm /> : <OtpLoginForm />}
-
-      {isDev ? (
-        <div className="border-border-default mt-6 border-t pt-5">
-          <p className="text-xs font-medium tracking-wide text-zinc-400 uppercase">
-            Dev tools
-          </p>
-          <button
-            type="button"
-            onClick={devSignIn}
-            disabled={devLoading}
-            className="mt-2 w-full rounded-md border border-dashed border-zinc-400 px-3 py-2 text-sm font-medium text-zinc-600 transition-colors hover:bg-zinc-50 hover:text-zinc-800"
-          >
-            {devLoading ? "Signing in…" : "Dev: Instant sign-in as dealer"}
-          </button>
-          {devError ? (
-            <p className="mt-2 text-xs text-red-600">{devError}</p>
-          ) : (
-            <p className="mt-1.5 text-xs text-zinc-400">
-              Auto-creates a dev dealer with store. Only works locally.
-            </p>
-          )}
-        </div>
       ) : null}
     </div>
   );
