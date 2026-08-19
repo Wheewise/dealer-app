@@ -3,20 +3,11 @@ import "./env";
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
-import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { db, unwrap, unwrapMaybe } from "./db";
 import { verifyOtp } from "./otp";
 
 const APP_ROLE = "DEALER";
-
-const credentialsSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(8),
-  dev: z.coerce.boolean().optional(),
-});
-
-const supabaseTokenSchema = z.object({ supabaseAccessToken: z.string().min(20) });
 
 const otpSchema = z.object({
   phone: z.string().min(10).max(15),
@@ -58,38 +49,13 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   providers: [
     Credentials({
       credentials: {
-        email: { label: "Email", type: "email" },
-        password: { label: "Password", type: "password" },
         phone: { label: "Phone", type: "tel" },
         otp: { label: "OTP", type: "text" },
         dev: { label: "Dev", type: "checkbox" },
-        supabaseAccessToken: { label: "Supabase access token", type: "text" },
       },
       async authorize(creds) {
-        // Dealer portal access starts with a Supabase email OTP. `getUser`
-        // validates the token against Supabase rather than trusting browser data.
-        if (creds.supabaseAccessToken) {
-          const parsed = supabaseTokenSchema.safeParse(creds);
-          if (!parsed.success) return null;
-          const url = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
-          const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-          if (!url || !anon) return null;
-          const supabase = createClient(url, anon, { auth: { persistSession: false } });
-          const { data, error } = await supabase.auth.getUser(parsed.data.supabaseAccessToken);
-          const email = data.user?.email?.toLowerCase();
-          if (error || !email) return null;
-          const user = unwrapMaybe(
-            await db.from("User").select("id, email, name, role").eq("email", email).maybeSingle(),
-            "auth: Supabase dealer lookup",
-          );
-          if (!user || user.role !== APP_ROLE) return null;
-          return { id: user.id, email: user.email, name: user.name, role: user.role };
-        }
-
-        // This portal deliberately has no password or legacy-SMS fallback.
-        if (!creds.supabaseAccessToken) return null;
-
-        // Phone OTP flow
+        // This portal authenticates dealers exclusively with the locally issued
+        // SMS code. It never delegates login OTP delivery to Supabase email.
         if (creds.phone && creds.otp) {
           const parsed = otpSchema.safeParse(creds);
           if (!parsed.success) return null;
@@ -98,29 +64,24 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           if (!valid) return null;
 
           const normalized = normalizePhone(parsed.data.phone);
-          const existing = unwrapMaybe(
+          const dealer = unwrapMaybe(
             await db
-              .from("User")
-              .select("id, email, name, role")
+              .from("Dealer")
+              .select("phone, status, user:User(id, email, name, role)")
               .eq("phone", normalized)
               .maybeSingle(),
-            "auth: lookup by phone",
+            "auth: dealer lookup by phone",
           );
+          const user = Array.isArray(dealer?.user) ? dealer.user[0] : dealer?.user;
 
-          if (existing?.role !== APP_ROLE) return null;
+          if (!dealer || dealer.status !== "ACTIVE" || user?.role !== APP_ROLE) return null;
 
-          if (existing) {
-            return {
-              id: existing.id,
-              email: null,
-              name: existing.name ?? `User ${normalized.slice(-4)}`,
-              role: existing.role,
-            };
-          }
-
-          // Dealer accounts are provisioned through registration, never from
-          // a portal login attempt.
-          return null;
+          return {
+            id: user.id,
+            email: user.email,
+            name: user.name ?? `Dealer ${normalized.slice(-4)}`,
+            role: user.role,
+          };
         }
 
         // Dev fast-login — requires BOTH WHEEWISE_DEV_LOGIN=1 AND NODE_ENV=development.
@@ -195,29 +156,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           };
         }
 
-        // Email/password flow
-        const parsed = credentialsSchema.safeParse(creds);
-        if (!parsed.success) return null;
-
-        const user = unwrapMaybe(
-          await db
-            .from("User")
-            .select("id, email, name, role, passwordHash")
-            .eq("email", parsed.data.email)
-            .maybeSingle(),
-          "auth: lookup by email",
-        );
-        if (!user || !user.passwordHash || user.role !== APP_ROLE) return null;
-
-        const ok = await bcrypt.compare(parsed.data.password, user.passwordHash);
-        if (!ok) return null;
-
-        return {
-          id: user.id,
-          email: user.email,
-          name: user.name,
-          role: user.role,
-        };
+        return null;
       },
     }),
   ],

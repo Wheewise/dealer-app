@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { LoginTabs } from "./LoginTabs";
+import { OtpLoginForm } from "./OtpLoginForm";
 
 export const metadata: Metadata = { title: "Dealer portal sign in" };
 
@@ -13,7 +13,7 @@ export default function LoginPage() {
           Sign in to manage your inventory, leads and dealership.
         </p>
       </div>
-      <LoginTabs />
+      <OtpLoginForm />
       <div className="border-border-default border-t pt-4">
         <p className="text-sm text-zinc-500">
           New dealer?{" "}

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { db, unwrapMaybe } from "@/lib/db";
 import { generateOtp, sendOtpSms } from "@/lib/otp";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
 import {
@@ -45,6 +46,25 @@ export async function POST(req: Request) {
 
   if (!phone || typeof phone !== "string" || normalizePhone(phone).length < 10) {
     return NextResponse.json({ error: "Valid phone number required" }, { status: 400 });
+  }
+
+  // This endpoint belongs to the dealer app: only an active dealership's
+  // registered phone can receive a sign-in code. Do this before generating a
+  // code or sending SMS so this endpoint cannot be used as a paid SMS relay.
+  const dealer = unwrapMaybe(
+    await db
+      .from("Dealer")
+      .select("id, status, user:User(role)")
+      .eq("phone", normalizePhone(phone))
+      .maybeSingle(),
+    "send-otp: dealer lookup",
+  );
+  const user = Array.isArray(dealer?.user) ? dealer.user[0] : dealer?.user;
+  if (!dealer || dealer.status !== "ACTIVE" || user?.role !== "DEALER") {
+    return NextResponse.json(
+      { error: "This mobile number is not registered for the dealer portal." },
+      { status: 403 },
+    );
   }
 
   // Per-phone cap blocks attackers cycling IPs to harass one number, and caps
