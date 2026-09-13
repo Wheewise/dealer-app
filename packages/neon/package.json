@@ -1,0 +1,12 @@
+{
+  "name": "@wheewise/neon",
+  "version": "0.0.0",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "server-only": "^0.0.1"
+  }
+}

@@ -1,0 +1,43 @@
+
+> dealer-app@0.0.0 build
+> next build
+
+   ▲ Next.js 15.5.25
+
+   Creating an optimized production build ...
+ ✓ Compiled successfully in 7.5s
+   Linting and checking validity of types ...
+   Collecting page data ...
+   Generating static pages (0/15) ...
+   Generating static pages (3/15) 
+   Generating static pages (7/15) 
+   Generating static pages (11/15) 
+ ✓ Generating static pages (15/15)
+   Finalizing page optimization ...
+   Collecting build traces ...
+
+Route (app)                                 Size  First Load JS
+┌ ƒ /                                      136 B         103 kB
+├ ƒ /_not-found                            988 B         104 kB
+├ ƒ /api/rto                               136 B         103 kB
+├ ƒ /api/uploads                           136 B         103 kB
+├ ○ /apple-icon.png                          0 B            0 B
+├ ƒ /dashboard                           2.87 kB         109 kB
+├ ƒ /dashboard/inventory/new              5.8 kB         108 kB
+├ ○ /icon.png                                0 B            0 B
+├ ƒ /login                               3.79 kB         110 kB
+├ ○ /manifest.webmanifest                  136 B         103 kB
+├ ƒ /onboarding                          3.59 kB         106 kB
+├ ○ /opengraph-image.png                     0 B            0 B
+└ ƒ /signup                              3.29 kB         106 kB
++ First Load JS shared by all             103 kB
+  ├ chunks/18-2c82660ce7c4918d.js        46.4 kB
+  ├ chunks/87c73c54-24122e7b92478d00.js  54.2 kB
+  └ other shared chunks (total)          1.99 kB
+
+
+ƒ Middleware                             93.1 kB
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+

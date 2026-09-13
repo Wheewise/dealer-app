@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@theme {
+  /* Brand — sampled from the wheewise wordmark (red + slate gray). Kept as
+     its own token separate from --color-danger even though both are red
+     right now: if the brand color ever changes, error/destructive UI
+     shouldn't silently change color with it. Learned that the hard way on
+     an earlier pass of this theme. */
+  --color-brand: #dc2626;
+  --color-brand-dark: #b91c1c;
+  --color-brand-soft: #ef4444;
+
+  --color-slate: #52525b;
+  --color-slate-dark: #3f3f46;
+
+  --color-danger: #dc2626;
+  --color-danger-dark: #b91c1c;
+  --color-success: #16a34a;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+:root {
+  --background: #ffffff;
+  --foreground: #18181b;
+  --surface-muted: #f4f4f5;
+  --border-default: #e4e4e7;
+}
+
+/* White/light theme is the deliberate default for this app (trust-first —
+   see PROJECT_MEMORY.md) — no dark-mode override block on purpose. */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface-muted: var(--surface-muted);
+  --color-border-default: var(--border-default);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* iOS Safari auto-zooms the whole page on focus for any form control whose
+   font-size computes under 16px — nothing to do with the viewport meta tag,
+   it's WebKit's own heuristic. Most inputs here use Tailwind's text-sm
+   (14px), which triggers it on every tap. !important because a plain
+   `input { font-size: 16px }` loses to any element's own text-sm/text-xs
+   class on specificity, not just source order. */
+input,
+select,
+textarea {
+  font-size: 16px !important;
+}
